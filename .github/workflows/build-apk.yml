@@ -27,9 +27,11 @@ jobs:
           java-version: "17"
 
       - name: 3/6 装系统依赖
+        # automake/libltdl-dev：编译 CPython 的 configure 要用 libtool 的 ltdl 宏，
+        # 缺了会报 "possibly undefined macro: LT_SYS_SYMBOL_USCORE"（首跑实测）
         run: |
           sudo apt-get update
-          sudo apt-get install -y git zip unzip python3-pip autoconf libtool pkg-config \
+          sudo apt-get install -y git zip unzip python3-pip autoconf automake libtool libltdl-dev pkg-config \
             zlib1g-dev libncurses5-dev libncursesw5-dev cmake libffi-dev libssl-dev
 
       - name: 4/6 装 buildozer（打包工具）
