@@ -44,13 +44,22 @@ from kivy.metrics import dp, sp
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
-from kivy.uix.spinner import Spinner
+from kivy.uix.spinner import Spinner, SpinnerOption
 from kivy.uix.tabbedpanel import TabbedPanel, TabbedPanelItem
 from kivy.uix.textinput import TextInput
 from kivy.uix.togglebutton import ToggleButton
 
 # 结果区/输入框统一字体；中文字形在安卓上必须显式指定，否则是方框
 FONT = "CJK"
+
+
+class CjkSpinnerOption(SpinnerOption):
+    """下拉选项要单独指定中文字体：Kivy 只把字体设在 Spinner 按钮上，
+    弹出的选项用小部件默认字体，安卓上全是方框（2026-09-16 手机实测）。"""
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("font_name", FONT)
+        super().__init__(**kwargs)
 
 
 def _setup_font():
@@ -212,6 +221,20 @@ def core_diff(t_text, x_text, mode):
     return "-" * 60 + "\n" + _capture(cc.search_diff_attr, kt_set, kx_set, desc, mode)
 
 
+def _prewarm_caches():
+    """开屏后台先把两张索引表建好（纯枚举、不抽随机数，谁的输出都不变）。
+    不预热的话，第一次点「等级」或「查」要现场枚举多等半秒（手机更久）。
+    表名哪天改了就当没有，静默跳过。"""
+    for name in ("_static_rows", "_dyn_data"):
+        fn = getattr(cc, name, None)
+        if fn is None:
+            continue
+        try:
+            fn()
+        except Exception:
+            pass
+
+
 # ========== 界面小零件 ==========
 # 页签内容区是 Kivy 默认主题的深灰底（约 RGB 48），这几处文字固定用浅色，否则看不清
 def hint_label(text, app):
@@ -288,8 +311,13 @@ class ChordApp(App):
     title = "和弦张力等级查询工具"
 
     def build(self):
+        # 默认 5ms 的时间片太长：后台线程算查询时（动态“全部输出”每次要算 2 秒左右），
+        # 主线程抢 GIL 会连续错过好几帧 —— 2026-09-16 实测计算期间主循环卡帧
+        # p99 28.9ms、反复出现 29ms 顿挫；缩到 1ms 后 p99 降到 15.4ms、最长 21ms。
+        sys.setswitchinterval(0.001)
         self._pending = 0
         self._result_target = None
+        self._tick_ev = None
 
         root = BoxLayout(orientation="vertical")
         self.status = Label(text="就绪", font_name=FONT, font_size=sp(12),
@@ -322,6 +350,7 @@ class ChordApp(App):
                 Window.softinput_mode = "below_target"
             except Exception:
                 pass
+        threading.Thread(target=_prewarm_caches, daemon=True).start()
 
     # ---------- 查询调度 ----------
     def _start_job(self, work, target):
@@ -331,8 +360,9 @@ class ChordApp(App):
             return
         self._pending += 1
         self._result_target = target
-        self.status.text = "查询中…"
         t0 = time.perf_counter()
+        self._tick_ev = Clock.schedule_interval(lambda _dt: self._show_elapsed(t0), 0.5)
+        self._show_elapsed(t0)
 
         def runner():
             try:
@@ -344,8 +374,15 @@ class ChordApp(App):
 
         threading.Thread(target=runner, daemon=True).start()
 
+    def _show_elapsed(self, t0):
+        """长查询要算好几秒，状态栏把秒数跳起来，别让人以为程序死了。"""
+        self.status.text = f"查询中… 已用 {time.perf_counter() - t0:.1f} 秒"
+
     def _finish(self, content, dt):
         self._pending -= 1
+        if self._tick_ev is not None:
+            self._tick_ev.cancel()
+            self._tick_ev = None
         self.status.text = f"完成（{dt:.2f} 秒）"
         target = self._result_target
         target.text = content.rstrip("\n")
@@ -397,7 +434,8 @@ class ChordApp(App):
         row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(6))
         row.add_widget(Label(text="温度等级：", font_name=FONT, font_size=sp(13), size_hint_x=None, width=dp(76)))
         self.grade_spin = Spinner(text="巨暖", values=cc.TEMP_GRADES, font_name=FONT,
-                                  font_size=sp(13), size_hint_y=None, height=dp(40))
+                                  font_size=sp(13), size_hint_y=None, height=dp(40),
+                                  option_cls=CjkSpinnerOption)
         row.add_widget(self.grade_spin)
         box.add_widget(row)
 
