@@ -3,6 +3,8 @@
 #   1. 每次往 main 或 master 分支上传/修改文件，自动跑；
 #   2. 也可以到仓库网页的 Actions 页手动点 "Run workflow" 跑。
 # 构建机是 GitHub 免费提供的国外 Linux 服务器，下载安卓 SDK/NDK 不会卡。
+# 签名用仓库根目录里固定的 debug.keystore（2026-09-16 起）：每次构建签名一致，
+# 手机上升级可直接覆盖安装，不用先卸载。
 
 name: 打包安卓 APK
 
@@ -39,11 +41,11 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install buildozer
 
-      - name: 5/6 恢复缓存（安卓 SDK/NDK + 调试签名）
-        # ~/.android 里放着 AGP 自动生成的调试签名 debug.keystore —— 不缓存的话，
-        # 每次构建都是全新机器、签名都不一样，手机上装新版会报“应用未安装”，
-        # 必须先卸载旧版。缓存住它，以后就能直接覆盖安装（2026-09-16 加）。
-        # 用 restore/save 分开的写法：restore-keys 还能吃到改名前的老缓存。
+      - name: 5/6 恢复缓存（安卓 SDK/NDK）
+        # 缓存只为省下载时间（SDK/NDK 体积大）。
+        # 签名不再靠它：曾把 ~/.android 一起缓存，实测三版 APK 的签名证书仍各不相同
+        # （缓存兜不住 AGP 实际使用的签名文件），所以改成 5.5 步用仓库里固定的 keystore。
+        # restore/save 分开的写法：restore-keys 还能吃到改名前的老缓存。
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -53,6 +55,24 @@ jobs:
           restore-keys: |
             buildozer-
 
+      - name: 5.5/6 固定调试签名（把仓库里的 debug.keystore 放到构建机）
+        # 构建机每次都是全新一台，AGP 自动生成的调试签名每次都不一样，
+        # 手机覆盖安装会报"应用未安装"。仓库根目录里这份 debug.keystore 是调试签名
+        # 专用文件（口令是安卓约定俗成的 android，不含任何隐私），拷到 AGP 默认读取的位置。
+        run: |
+          set -e
+          echo "HOME=$HOME"
+          echo "ANDROID_SDK_HOME=[$ANDROID_SDK_HOME] ANDROID_USER_HOME=[$ANDROID_USER_HOME]"
+          echo "== 恢复缓存后 ~/.android 内容（诊断）："
+          ls -la ~/.android 2>&1 || true
+          echo "== 构建机上现成的 debug.keystore（诊断）："
+          find /home/runner /usr/local/lib/android -name debug.keystore 2>/dev/null || true
+          mkdir -p ~/.android
+          cp debug.keystore ~/.android/debug.keystore
+          if [ -n "$ANDROID_SDK_HOME" ]; then mkdir -p "$ANDROID_SDK_HOME/.android"; cp debug.keystore "$ANDROID_SDK_HOME/.android/debug.keystore"; fi
+          if [ -n "$ANDROID_USER_HOME" ]; then mkdir -p "$ANDROID_USER_HOME"; cp debug.keystore "$ANDROID_USER_HOME/debug.keystore"; fi
+          ls -la ~/.android/debug.keystore
+
       - name: 6/6 构建 APK
         # charset-normalizer 3.5 起在 PyPI 上带安卓专用 wheel，p4a 解析依赖时会选中它，
         # 但最后安装那一步不带平台参数，pip 拒装安卓 wheel（构建 #3 实测报
@@ -61,6 +81,27 @@ jobs:
         run: |
           echo "charset-normalizer<3.5" > /tmp/pip-constraints.txt
           PIP_CONSTRAINT=/tmp/pip-constraints.txt buildozer -v android debug
+
+      - name: 6.4/6 核验签名指纹（和仓库里的 keystore 对不上就报错）
+        run: |
+          set -e
+          APKSIGNER=$(find ~/.buildozer/android/platform/android-sdk /usr/local/lib/android/sdk -name apksigner -type f 2>/dev/null | sort | tail -1 || true)
+          if [ ! -x "$APKSIGNER" ]; then echo "找不到 apksigner：[$APKSIGNER]"; exit 1; fi
+          echo "apksigner: $APKSIGNER"
+          APK=$(ls bin/*.apk | head -1)
+          echo "APK: $APK"
+          "$APKSIGNER" verify --print-certs "$APK" | head -8
+          EXPECTED=$(keytool -list -v -keystore debug.keystore -storepass android -alias androiddebugkey | grep -i "sha256:" | head -1 | awk '{print $NF}' | tr -d ':' | tr 'A-Z' 'a-z' || true)
+          ACTUAL=$("$APKSIGNER" verify --print-certs "$APK" | grep -i "SHA-256 digest" | head -1 | awk '{print $NF}' | tr 'A-Z' 'a-z' || true)
+          echo "期望证书指纹: $EXPECTED"
+          echo "实际证书指纹: $ACTUAL"
+          if [ -z "$EXPECTED" ] || [ -z "$ACTUAL" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "!! 签名不一致：APK 不是用仓库里的 debug.keystore 签的"
+            exit 1
+          fi
+          echo "签名核验通过：本次 APK 与仓库 keystore 一致，升级可覆盖安装"
+          echo "== 构建后机器上的 debug.keystore（诊断）："
+          find /home/runner -name debug.keystore 2>/dev/null || true
 
       - name: 6.5/6 存回缓存（构建失败也存，下载过的东西下次直接用）
         uses: actions/cache/save@v4
