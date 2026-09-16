@@ -14,7 +14,7 @@ search_static_attr / search_dynamic_attr / search_diff_attr 等），
   查询 —— 单和弦 / 和声进行
   等级 —— 温度 11 档查找（静态 / 动态 / 两个都查；随机一个 / 全部输出）
   批量 —— 每行一个和弦
-  查   —— 和弦查属性；属性查和弦（静态 / 动态[动态温度/张力档 或 差值]）
+  查   —— 和弦查属性；属性查和弦（静态 / 动态[温度/张力/温度差/张力差 四条件可混填]）
 
 查询在后台线程里跑，结果经 Clock 回主线程显示，界面不会卡死。
 """
@@ -174,58 +174,17 @@ def core_attr_static(t_text, x_text, mode):
     return "-" * 60 + "\n" + _capture(cc.search_static_attr, grade_set, level_set, desc, mode)
 
 
-def core_attr_dynamic(t_text, x_text, mode):
-    """属性查和弦（动态）：温度条件 × 动态张力带条件，至少输一个。"""
-    t_text, x_text = t_text.strip(), x_text.strip()
-    if not t_text and not x_text:
-        return "  温度和张力至少输一个。\n"
-    gi_set = k2_set = None
-    desc_parts = []
-    if t_text:
-        cond = cc.parse_temperature_cond(t_text)
-        if cond is None:
-            return f"  温度条件“{t_text}”无法识别（可用：大暖、7、6-8、-8~-6）。\n"
-        names, disp = cond
-        desc_parts.append(f"温度 {disp}")
-        gi_set = {cc.TEMP_GRADES.index(g) for g in names}
-    if x_text:
-        cond = cc.parse_dynamic_tension_cond(x_text)
-        if cond is None:
-            return f"  张力条件“{x_text}”无法识别（动态可用：7.5、6-12，范围 0~20）。\n"
-        k2_set, disp = cond
-        desc_parts.append(f"张力 {disp}")
-    desc = " × ".join(desc_parts)
-    return "-" * 60 + "\n" + _capture(cc.search_dynamic_attr, gi_set, k2_set, desc, mode)
-
-
-def core_diff(t_text, x_text, mode):
-    """差值查对：温度差档号 × 张力差档号，至少输一个。"""
-    t_text, x_text = t_text.strip(), x_text.strip()
-    if not t_text and not x_text:
-        return "  温度差和张力差至少输一个。\n"
-    kt_set = kx_set = None
-    desc_parts = []
-    if t_text:
-        cond = cc.parse_diff_band_cond(t_text, 20)
-        if cond is None:
-            return f"  温度差条件“{t_text}”无法识别（可输档号 1~20，区间如 3-5）。\n"
-        kt_set, disp = cond
-        desc_parts.append(f"温度差 {disp}")
-    if x_text:
-        cond = cc.parse_diff_band_cond(x_text, 10)
-        if cond is None:
-            return f"  张力差条件“{x_text}”无法识别（可输档号 1~10，区间如 3-5）。\n"
-        kx_set, disp = cond
-        desc_parts.append(f"张力差 {disp}")
-    desc = " × ".join(desc_parts)
-    return "-" * 60 + "\n" + _capture(cc.search_diff_attr, kt_set, kx_set, desc, mode)
+def core_attr_dynamic(t_text, x_text, td_text, xd_text, mode):
+    """属性查和弦（动态）：温度/张力/温度差/张力差四条件可混填，至少一个。
+    解析、查错、分发与命令行走同一条路（cc.run_attr_search_cond），提示一字不差。"""
+    return _capture(cc.run_attr_search_cond, t_text, x_text, td_text, xd_text, mode)
 
 
 def _prewarm_caches():
-    """开屏后台先把两张索引表建好（纯枚举、不抽随机数，谁的输出都不变）。
+    """开屏后台先把几张索引表建好（纯枚举/解码、不抽随机数，谁的输出都不变）。
     不预热的话，第一次点「等级」或「查」要现场枚举多等半秒（手机更久）。
     表名哪天改了就当没有，静默跳过。"""
-    for name in ("_static_rows", "_dyn_data"):
+    for name in ("_static_rows", "_dyn_data", "_pair4_totals", "_diff_static_values"):
         fn = getattr(cc, name, None)
         if fn is None:
             continue
@@ -509,26 +468,28 @@ class ChordApp(App):
         self.ca_box.height = dp(38 + 40 + 6 + 22)
         box.add_widget(self.ca_box)
 
-        # 方向二：属性查和弦（静态 / 动态[动态温度/张力档 或 差值]）
+        # 方向二：属性查和弦（静态 / 动态[温度/张力/温度差/张力差 四条件可混填]）
         self.as_box = BoxLayout(orientation="vertical", spacing=dp(2), size_hint_y=None, height=dp(1))
         row_as, self.as_kind_btns = toggle_row(["静态", "动态"], "as_kind", "静态")
         self.as_box.add_widget(row_as)
-        self.as_sub_row, self.as_dyn_btns = toggle_row(["动态温度/张力档", "温度差/张力差（差值）"], "as_dyn", "动态温度/张力档")
-        self.as_box.add_widget(self.as_sub_row)
-        row_c1 = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(6))
-        self.lbl_c1 = Label(text="温度条件：", font_name=FONT, font_size=sp(13), size_hint_x=None, width=dp(112))
-        self.ent_c1 = entry()
-        self.ent_c1.bind(on_text_validate=lambda *_: self._run_attr())
-        row_c1.add_widget(self.lbl_c1)
-        row_c1.add_widget(self.ent_c1)
-        self.as_box.add_widget(row_c1)
-        row_c2 = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(6))
-        self.lbl_c2 = Label(text="张力条件：", font_name=FONT, font_size=sp(13), size_hint_x=None, width=dp(112))
-        self.ent_c2 = entry()
-        self.ent_c2.bind(on_text_validate=lambda *_: self._run_attr())
-        row_c2.add_widget(self.lbl_c2)
-        row_c2.add_widget(self.ent_c2)
-        self.as_box.add_widget(row_c2)
+
+        def cond_row(label_text):
+            row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(6))
+            lbl = Label(text=label_text, font_name=FONT, font_size=sp(13), size_hint_x=None, width=dp(150))
+            ent = entry()
+            ent.bind(on_text_validate=lambda *_: self._run_attr())
+            row.add_widget(lbl)
+            row.add_widget(ent)
+            return row, lbl, ent
+
+        self.row_c1, self.lbl_c1, self.ent_c1 = cond_row("温度条件：")
+        self.as_box.add_widget(self.row_c1)
+        self.row_c2, self.lbl_c2, self.ent_c2 = cond_row("张力条件：")
+        self.as_box.add_widget(self.row_c2)
+        self.row_c3, self.lbl_c3, self.ent_c3 = cond_row("温度差条件（1~20）：")
+        self.as_box.add_widget(self.row_c3)
+        self.row_c4, self.lbl_c4, self.ent_c4 = cond_row("张力差条件（1~10）：")
+        self.as_box.add_widget(self.row_c4)
         self.lbl_as_hint = hint_label("", self)
         self.as_box.add_widget(self.lbl_as_hint)
         row_mode = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(4))
@@ -538,7 +499,7 @@ class ChordApp(App):
         row_mode.add_widget(mode_box)
         row_mode.add_widget(flat_button("查询", lambda *_: self._run_attr()))
         self.as_box.add_widget(row_mode)
-        self.as_box.height = dp(38 + 38 + 40 + 40 + 40 + 22 + 40 + 20)
+        self.as_box.height = dp(368)
         box.add_widget(self.as_box)
 
         self.box_attr = result_box()
@@ -549,8 +510,6 @@ class ChordApp(App):
             btn.bind(on_press=lambda *_: self._refresh_attr())
         for btn in self.as_kind_btns.values():
             btn.bind(on_press=lambda *_: self._refresh_attr())
-        for btn in self.as_dyn_btns.values():
-            btn.bind(on_press=lambda *_: self._refresh_attr())
         for btn in self.ca_kind_btns.values():
             btn.bind(on_press=lambda *_: self._refresh_attr())
 
@@ -559,31 +518,31 @@ class ChordApp(App):
     def _refresh_attr(self):
         chord_dir = picked(self.attr_dir_btns) == "和弦查属性"
         static = picked(self.as_kind_btns) == "静态"
-        diff = (not static) and picked(self.as_dyn_btns) == "温度差/张力差（差值）"
 
         set_visible(self.ca_box, chord_dir, dp(38 + 40 + 6 + 22) if chord_dir else 0)
         set_visible(self.as_box, not chord_dir,
-                    dp(38 + (0 if static else 38) + 40 + 40 + 40 + 22 + 40 + 20) if not chord_dir else 0)
-        set_visible(self.as_sub_row, not static, dp(38))
+                    dp(38 + (80 if static else 160) + (66 if static else 110) + 40 + 20) if not chord_dir else 0)
 
         self.lbl_ca_hint.text = ("请输入一个和弦，如 C E G" if picked(self.ca_kind_btns) == "静态（1 个和弦）"
                                  else "请输入两个和弦，用 / 隔开，如 C E G / D F A")
         if static:
+            set_visible(self.row_c3, False)
+            set_visible(self.row_c4, False)
             self.lbl_c1.text = "温度条件："
             self.lbl_c2.text = "张力条件："
             self.lbl_as_hint.text = ("温度：大暖、7、6-8、-8~-6；静态张力=等级：5a、7（组7 全部）、0.645（就近等级）、"
                                      "4-6（组4~组6）；两个都填或只填一个（至少一个）。")
-        elif not diff:
+        else:
+            set_visible(self.row_c3, True, dp(40))
+            set_visible(self.row_c4, True, dp(40))
             self.lbl_c1.text = "温度条件："
             self.lbl_c2.text = "张力条件："
+            self.lbl_c3.text = "温度差条件（1~20）："
+            self.lbl_c4.text = "张力差条件（1~10）："
             self.lbl_as_hint.text = ("温度：大暖、7、6-8、-8~-6；动态张力按 2 度带（0-2、2-4 … 18-20）：7.5、6-12，"
-                                     "范围 0~20；两个都填或只填一个（至少一个）。")
-        else:
-            self.lbl_c1.text = "温度差条件 1~20："
-            self.lbl_c2.text = "张力差条件 1~10："
-            self.lbl_as_hint.text = ("按档号（和弦2 减和弦1）：温度差 档1 = -20~-18 … 档10 = -2~0、档11 = 0~2 … 档20 = 18~20；"
-                                     "张力差 档1 = -10~-8 … 档5 = -2~0、档6 = 0~2 … 档10 = 8~10；"
-                                     "可输档号或闭区间（如 10、3-5），至少一个。")
+                                     "范围 0~20。差值按档号（和弦2 减和弦1）：温度差 档1 = -20~-18 … 档10 = -2~0、"
+                                     "档11 = 0~2 … 档20 = 18~20；张力差 档1 = -10~-8 … 档5 = -2~0、档6 = 0~2 … "
+                                     "档10 = 8~10；可输档号或闭区间（如 10、3-5）。四行可随意混填、至少一个，同时生效。")
 
     def _run_attr(self):
         if picked(self.attr_dir_btns) == "和弦查属性":
@@ -595,15 +554,13 @@ class ChordApp(App):
             return
         t_text = self.ent_c1.text
         x_text = self.ent_c2.text
+        td_text = self.ent_c3.text
+        xd_text = self.ent_c4.text
         mode = "all" if picked(self.as_mode_btns) == "全部输出" else "one"
-        static = picked(self.as_kind_btns) == "静态"
-        diff = (not static) and picked(self.as_dyn_btns) == "温度差/张力差（差值）"
-        if static:
+        if picked(self.as_kind_btns) == "静态":
             work = lambda: core_attr_static(t_text, x_text, mode)
-        elif diff:
-            work = lambda: core_diff(t_text, x_text, mode)
         else:
-            work = lambda: core_attr_dynamic(t_text, x_text, mode)
+            work = lambda: core_attr_dynamic(t_text, x_text, td_text, xd_text, mode)
         self._start_job(work, self.box_attr)
 
     # ---------- 通用 ----------
