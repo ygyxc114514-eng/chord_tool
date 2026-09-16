@@ -62,6 +62,7 @@ jobs:
         run: |
           set -e
           echo "HOME=$HOME"
+          echo "USER=$(whoami)"
           echo "ANDROID_SDK_HOME=[$ANDROID_SDK_HOME] ANDROID_USER_HOME=[$ANDROID_USER_HOME]"
           echo "== 恢复缓存后 ~/.android 内容（诊断）："
           ls -la ~/.android 2>&1 || true
@@ -72,6 +73,9 @@ jobs:
           if [ -n "$ANDROID_SDK_HOME" ]; then mkdir -p "$ANDROID_SDK_HOME/.android"; cp debug.keystore "$ANDROID_SDK_HOME/.android/debug.keystore"; fi
           if [ -n "$ANDROID_USER_HOME" ]; then mkdir -p "$ANDROID_USER_HOME"; cp debug.keystore "$ANDROID_USER_HOME/debug.keystore"; fi
           ls -la ~/.android/debug.keystore
+          echo "== 放置后校验（仓库 vs 构建机）："
+          sha256sum debug.keystore ~/.android/debug.keystore
+          cp ~/.android/debug.keystore /tmp/keystore_before_build
 
       - name: 6/6 构建 APK
         # charset-normalizer 3.5 起在 PyPI 上带安卓专用 wheel，p4a 解析依赖时会选中它，
@@ -82,26 +86,84 @@ jobs:
           echo "charset-normalizer<3.5" > /tmp/pip-constraints.txt
           PIP_CONSTRAINT=/tmp/pip-constraints.txt buildozer -v android debug
 
-      - name: 6.4/6 核验签名指纹（和仓库里的 keystore 对不上就报错）
+      - name: 6.4/6 核验签名指纹（和仓库里的 keystore 对不上就自动重签）
+        # 这一步把关键证据打进日志（两侧指纹、全盘 find 到的 debug.keystore、
+        # 构建前 keystore 哈希），并写一份到 job 摘要。
+        # 若 AGP 没有用仓库里的 keystore（指纹对不上），就用 apksigner 以仓库
+        # keystore 重新签名，保证产物证书始终固定；重签后再次核验，仍不过才失败。
         run: |
-          set -e
+          exec 2>&1
+          echo "== 环境 =="
+          echo "HOME=$HOME"
+          echo "== 构建后机器上所有 debug.keystore（诊断，含指纹与时间）："
+          timeout 90 find / -name debug.keystore -not -path "/proc/*" 2>/dev/null | while read -r f; do echo "$f | $(sha256sum "$f" 2>/dev/null | awk '{print $1}') | $(stat -c %y "$f" 2>/dev/null)"; done || true
+          echo "== 仓库 keystore vs 构建前拷贝 =="
+          sha256sum debug.keystore 2>/dev/null || true
+          sha256sum /tmp/keystore_before_build 2>/dev/null || true
+          echo "== 产物 =="
+          ls -la bin/ 2>/dev/null || true
+          APK=$(ls bin/*.apk 2>/dev/null | head -1 || true)
+          echo "APK=[$APK]"
+          KT=$(command -v keytool 2>/dev/null || true)
+          if [ -z "$KT" ] && [ -n "$JAVA_HOME" ] && [ -x "$JAVA_HOME/bin/keytool" ]; then KT="$JAVA_HOME/bin/keytool"; fi
+          echo "keytool=[$KT] JAVA_HOME=[$JAVA_HOME]"
+          EXPECTED=""
+          if [ -n "$KT" ]; then
+            "$KT" -list -v -keystore debug.keystore -storepass android -alias androiddebugkey > /tmp/kt.txt 2>&1 || true
+            head -40 /tmp/kt.txt
+            EXPECTED=$(grep -i "sha256:" /tmp/kt.txt | head -1 | awk '{print $NF}' | tr -d ':' | tr 'A-Z' 'a-z' || true)
+          fi
+          echo "期望证书指纹: [$EXPECTED]"
           APKSIGNER=$(find ~/.buildozer/android/platform/android-sdk /usr/local/lib/android/sdk -name apksigner -type f 2>/dev/null | sort | tail -1 || true)
-          if [ ! -x "$APKSIGNER" ]; then echo "找不到 apksigner：[$APKSIGNER]"; exit 1; fi
-          echo "apksigner: $APKSIGNER"
-          APK=$(ls bin/*.apk | head -1)
-          echo "APK: $APK"
-          "$APKSIGNER" verify --print-certs "$APK" | head -8
-          EXPECTED=$(keytool -list -v -keystore debug.keystore -storepass android -alias androiddebugkey | grep -i "sha256:" | head -1 | awk '{print $NF}' | tr -d ':' | tr 'A-Z' 'a-z' || true)
-          ACTUAL=$("$APKSIGNER" verify --print-certs "$APK" | grep -i "SHA-256 digest" | head -1 | awk '{print $NF}' | tr 'A-Z' 'a-z' || true)
-          echo "期望证书指纹: $EXPECTED"
-          echo "实际证书指纹: $ACTUAL"
+          ZIPALIGN=$(find ~/.buildozer/android/platform/android-sdk /usr/local/lib/android/sdk -name zipalign -type f 2>/dev/null | sort | tail -1 || true)
+          echo "apksigner=[$APKSIGNER] zipalign=[$ZIPALIGN]"
+          # 备用证书解析器（纯 python 读 APK v2 签名块），apksigner 不可用时兜底
+          echo 'aW1wb3J0IHN0cnVjdCwgaGFzaGxpYiwgc3lzCmQgPSBvcGVuKHN5cy5hcmd2WzFdLCAncmInKS5yZWFkKCkKZSA9IGQucmZpbmQoYidQS1x4MDVceDA2JykKY2QgPSBzdHJ1Y3QudW5wYWNrX2Zyb20oJzxJJywgZCwgZSArIDE2KVswXQptID0gZC5yZmluZChiJ0FQSyBTaWcgQmxvY2sgNDInLCAwLCBjZCkKaWYgbSA+PSAwOgogICAgc2l6ZSA9IHN0cnVjdC51bnBhY2tfZnJvbSgnPFEnLCBkLCBtIC0gOClbMF0KICAgIHBvcyA9IG0gKyA4IC0gc2l6ZSArIDgKICAgIGVuZCA9IG0gLSA4CiAgICBkZWYgdTMyKGIsIG8pOgogICAgICAgIHJldHVybiBzdHJ1Y3QudW5wYWNrX2Zyb20oJzxJJywgYiwgbylbMF0KICAgIGRlZiBscChiLCBvKToKICAgICAgICBuID0gdTMyKGIsIG8pCiAgICAgICAgcmV0dXJuIGJbbys0Om8rNCtuXSwgbys0K24KICAgIHdoaWxlIHBvcyA8IGVuZDoKICAgICAgICBwbGVuID0gc3RydWN0LnVucGFja19mcm9tKCc8UScsIGQsIHBvcylbMF0KICAgICAgICBwaWQgPSB1MzIoZCwgcG9zICsgOCkKICAgICAgICBpZiBwaWQgaW4gKDB4NzEwOTg3MWEsIDB4ZjA1MzY4YzApOgogICAgICAgICAgICBzaWduZXJzLCBfID0gbHAoZFtwb3MrMTI6cG9zKzgrcGxlbl0sIDApCiAgICAgICAgICAgIHNpZ25lciwgXyA9IGxwKHNpZ25lcnMsIDApCiAgICAgICAgICAgIHNkLCBfID0gbHAoc2lnbmVyLCAwKQogICAgICAgICAgICBfZGcsIG8yID0gbHAoc2QsIDApCiAgICAgICAgICAgIGNlcnRzLCBfID0gbHAoc2QsIG8yKQogICAgICAgICAgICBjZXJ0LCBfID0gbHAoY2VydHMsIDApCiAgICAgICAgICAgIHByaW50KGhhc2hsaWIuc2hhMjU2KGNlcnQpLmhleGRpZ2VzdCgpKQogICAgICAgICAgICBicmVhawogICAgICAgIHBvcyArPSA4ICsgcGxlbgo=' | base64 -d > /tmp/apkcert.py
+          cert_of() {
+            # 显示指定 apk 的签名证书 SHA-256（先 apksigner，失败则 python 解析 v2 块）
+            local apk="$1"
+            local got=""
+            if [ -x "$APKSIGNER" ]; then
+              "$APKSIGNER" verify --print-certs "$apk" > /tmp/as.txt 2>&1 || true
+              got=$(grep -i "SHA-256 digest" /tmp/as.txt | head -1 | awk '{print $NF}' | tr -d ':' | tr 'A-Z' 'a-z' || true)
+            fi
+            if [ -z "$got" ]; then
+              got=$(python3 /tmp/apkcert.py "$apk" 2>/dev/null || true)
+            fi
+            echo "$got"
+          }
+          ACTUAL=""
+          if [ -n "$APK" ]; then ACTUAL=$(cert_of "$APK" | tail -1); fi
+          echo "实际证书指纹: [$ACTUAL]"
           if [ -z "$EXPECTED" ] || [ -z "$ACTUAL" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
-            echo "!! 签名不一致：APK 不是用仓库里的 debug.keystore 签的"
+            echo "== AGP 用的不是仓库里的 keystore，改用 apksigner 以仓库 keystore 重签 =="
+            if [ -x "$APKSIGNER" ] && [ -n "$APK" ]; then
+              if [ -x "$ZIPALIGN" ]; then
+                "$ZIPALIGN" -f -p 4 "$APK" /tmp/aligned.apk || { echo "zipalign 失败"; exit 1; }
+              else
+                cp "$APK" /tmp/aligned.apk
+              fi
+              "$APKSIGNER" sign --ks debug.keystore --ks-pass pass:android --ks-key-alias androiddebugkey --key-pass pass:android --out /tmp/resigned.apk /tmp/aligned.apk || { echo "重签失败"; exit 1; }
+              cp /tmp/resigned.apk "$APK"
+              ACTUAL=$(cert_of "$APK" | tail -1)
+              echo "重签后实际证书指纹: [$ACTUAL]"
+            else
+              echo "apksigner 不可用，无法重签"
+            fi
+          fi
+          {
+            echo "### 签名核验"
+            echo ""
+            echo "- keystore（仓库）sha256: $(sha256sum debug.keystore 2>/dev/null | awk '{print $1}')"
+            echo "- keystore（构建机 ~/.android）sha256: $(sha256sum ~/.android/debug.keystore 2>/dev/null | awk '{print $1}')"
+            echo "- 期望指纹: $EXPECTED"
+            echo "- 最终实际指纹: $ACTUAL"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$EXPECTED" ] || [ -z "$ACTUAL" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "!! 签名不一致：见上方诊断"
             exit 1
           fi
           echo "签名核验通过：本次 APK 与仓库 keystore 一致，升级可覆盖安装"
-          echo "== 构建后机器上的 debug.keystore（诊断）："
-          find /home/runner -name debug.keystore 2>/dev/null || true
 
       - name: 6.5/6 存回缓存（构建失败也存，下载过的东西下次直接用）
         uses: actions/cache/save@v4
@@ -116,6 +178,8 @@ jobs:
 
       - name: 上传 APK 成品
         uses: actions/upload-artifact@v4
+        # if: always()：即使 6.4 核验失败，也把 APK 传上来留作诊断材料
+        if: always()
         with:
           name: chordtool-apk
           path: bin/*.apk
