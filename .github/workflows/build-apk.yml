@@ -48,7 +48,13 @@ jobs:
             buildozer-
 
       - name: 6/6 构建 APK
-        run: buildozer -v android debug
+        # charset-normalizer 3.5 起在 PyPI 上带安卓专用 wheel，p4a 解析依赖时会选中它，
+        # 但最后安装那一步不带平台参数，pip 拒装安卓 wheel（构建 #3 实测报
+        # "charset_normalizer ... is not a supported wheel on this platform"）。
+        # 约束到 3.5 以下（只有 py3-none-any 通用包，本机复刻验证过），绕开这个问题。
+        run: |
+          echo "charset-normalizer<3.5" > /tmp/pip-constraints.txt
+          PIP_CONSTRAINT=/tmp/pip-constraints.txt buildozer -v android debug
 
       - name: 上传 APK 成品
         uses: actions/upload-artifact@v4
