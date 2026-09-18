@@ -2451,6 +2451,449 @@ def chord_label(pitch_classes, bass_pc):
     return " ".join([PITCH_TO_NAME[bass_pc]] + [PITCH_TO_NAME[p] for p in rest])
 
 
+# ========== 含音 / 音数约束（2026-09-18 新增） ==========
+# 约束 = (pcs, lo, hi)：pcs = 必须包含的音（frozenset，None = 不限）；
+# lo / hi = 音数下限 / 上限（None = 不限）。文字写法：含 C E、含CE、4音、3-4音。
+# 成对结果（A → B）里的约束一律作用在“和弦2”（被找的下一个和弦）。
+import bisect
+
+_EAT_SEPS = " \t,，、"
+_CON_SIZE_RE = re.compile(r"(\d{1,2})\s*(?:~|～|到|—|-)\s*(\d{1,2})\s*音")
+_CON_SIZE1_RE = re.compile(r"(\d{1,2})\s*音")
+_CONST_CACHE = {}
+
+
+def _eat_chord_names(head):
+    """从文本开头贪心吃音名（每个最长优先 3/2/1 字），返回 (音名表, 剩余文本)。
+    吃不动就停；空白与常用分隔符跳过。音名交给 normalize_token 规范化。"""
+    names = []
+    while head:
+        head = head.lstrip(_EAT_SEPS)
+        if not head:
+            break
+        hit = None
+        for n in (3, 2, 1):
+            chunk = head[:n]
+            if len(chunk) == n and not any(ch in _EAT_SEPS for ch in chunk):
+                name = normalize_token(chunk)
+                if name is not None:
+                    hit = (name, n)
+                    break
+        if hit is None:
+            break
+        names.append(hit[0])
+        head = head[hit[1]:]
+    return names, head
+
+
+def parse_constraints(text, bare_ok=False):
+    """从文本里剥出“含音 / 音数”约束 → (剩余文本, con, 说明, 错误)。
+    含音：含 C E、含CE（音名支持全套写法，如 jE、C#、Djj）；音数：4音、3-4音
+    （范围 2~12，写满 2-12 等于不限）。bare_ok=True 时也允许不带“含”直接写
+    音名（界面上的约束输入框用）。错误非空 = 写错，调用方直接打印；con = None
+    = 没有约束。剩余文本 = 去掉约束语句后的用户原输入，照旧走后续解析。"""
+    text = text.strip()
+    if not text:
+        return text, None, "", ""
+    pcs = None
+    lo = hi = None
+    size_raw = None
+    m = _CON_SIZE_RE.search(text)
+    if m:
+        size_raw = m.group(0)
+        lo, hi = int(m.group(1)), int(m.group(2))
+        text = (text[:m.start()] + " " + text[m.end():]).strip()
+    else:
+        m = _CON_SIZE1_RE.search(text)
+        if m:
+            size_raw = m.group(0)
+            lo = hi = int(m.group(1))
+            text = (text[:m.start()] + " " + text[m.end():]).strip()
+    if size_raw is not None and not (2 <= lo <= hi <= 12):
+        return text, None, "", f"“{size_raw}”不合法：音数范围 2~12，且前一个数不能大于后一个。"
+    idx = text.find("含")
+    names = []
+    if idx >= 0:
+        names, tail = _eat_chord_names(text[idx + 1:])
+        text = (text[:idx] + " " + tail).strip()
+    elif bare_ok and text:
+        names, text = _eat_chord_names(text)
+        text = text.strip()
+    if names:
+        pcs = frozenset(NAME_TO_PITCH[n] for n in names)
+    elif size_raw is None:
+        if idx >= 0:
+            return text, None, "", "“含”后面没认出音名（写法：含 C E、4音、3-4音）。"
+        if bare_ok:
+            return text, None, "", "约束里没认出音名（写法：含 C E、4音、3-4音）。"
+    if pcs is not None and hi is not None and len(pcs) > hi:
+        return text, None, "", f"矛盾：要含 {len(pcs)} 个音，却限了 {hi} 音以内。"
+    if lo == 2 and hi == 12:
+        lo = hi = None
+    if pcs is None and lo is None:
+        return text, None, "", ""
+    con = (pcs, lo, hi)
+    return text, con, constraint_desc(con), ""
+
+
+def parse_constraint_arg(con_text):
+    """界面/命令行传来的约束文本 → (con, 错误)。空文本 = (None, None)；
+    写错时返回 (None, 可直接打印的提示)。"""
+    if not con_text or not con_text.strip():
+        return None, None
+    con_text = con_text.strip()
+    rest, con, desc, err = parse_constraints(con_text, bare_ok=True)
+    if err:
+        return None, "  " + err
+    if rest:
+        return None, f"  约束“{con_text}”里有多余内容“{rest}”（写法：含 C E、4音、3-4音）。"
+    return con, None
+
+
+def constraint_matches(S, con):
+    """音集 S 是否满足约束：音数在范围内（不限则不看）+ 含音全部在内。"""
+    pcs, lo, hi = con
+    if lo is not None and not (lo <= len(S) <= hi):
+        return False
+    return pcs is None or pcs <= S
+
+
+def constraint_desc(con):
+    """约束 → 说明文字：含 C E、4音、含 C E 4音；音名按音高排序。"""
+    pcs, lo, hi = con
+    parts = []
+    if pcs:
+        parts.append("含 " + " ".join(PITCH_TO_NAME[p] for p in sorted(pcs)))
+    if lo is not None:
+        parts.append(f"{lo}音" if lo == hi else f"{lo}-{hi}音")
+    return " ".join(parts)
+
+
+def _con_tag(con, pair):
+    """输出行里的约束标记：单和弦 （含 C E） / 成对 （和弦2 含 C E）。"""
+    return f"（{'和弦2 ' if pair else ''}{constraint_desc(con)}）"
+
+
+def _level_tables(d):
+    """{等级: {vt: [组合号]}} → {等级: (vts 升序, 前缀起点表, 平铺组合号表, 原字典)}。
+    前缀起点表有 len(vts)+1 项，窗内组合号 = flat[starts[i]:starts[j]]。"""
+    out = {}
+    for level, vd in d.items():
+        vts = sorted(vd)
+        starts = [0]
+        flat = []
+        for vt in vts:
+            flat.extend(vd[vt])
+            starts.append(len(flat))
+        out[level] = (vts, starts, flat, vd)
+    return out
+
+
+def _const_cache(con):
+    """含音/音数约束的成对筛算缓存（con 做键，最多留 8 份，超了整体清空）。
+    按类（等级, 方向格, 对径）分组，逐类记两侧组合号：全部（_all）与约束内（_con）。
+    gi / k2 只由两个类决定（已全量核对过，见 2026-09-18 基准），所以类对级
+    只算一次公式；类的坐标沿用 (x → 角度) 的复算口径（与联合计数表同一套）。"""
+    cache = _CONST_CACHE.get(con)
+    if cache is not None:
+        return cache
+    if len(_CONST_CACHE) >= 8:
+        _CONST_CACHE.clear()
+    combos = _dyn_data()[0]
+    stats = _diff_static_values()
+    classes = {}
+    level_all = {}
+    level_con = {}
+    for cid, c in enumerate(combos):
+        S, bass, level, point, direction, x, tie = c
+        vt = stats[cid][0]
+        key = (level, x, tie)
+        cls = classes.get(key)
+        if cls is None:
+            r = level_to_radius_ratio(level) * 10.0
+            ang = math.radians(x * 30.0 / _DIR_SCALE)
+            cls = classes[key] = (r * math.cos(ang), r * math.sin(ang), r, r == 0, tie, x, {}, {})
+        cls[6].setdefault(vt, []).append(cid)
+        level_all.setdefault(level, {}).setdefault(vt, []).append(cid)
+        if constraint_matches(S, con):
+            cls[7].setdefault(vt, []).append(cid)
+            level_con.setdefault(level, {}).setdefault(vt, []).append(cid)
+    cls_list = []
+    for (level, x, tie), cls in classes.items():
+        d_all, d_con = cls[6], cls[7]
+        subs = sorted((vt, cids, d_con.get(vt, [])) for vt, cids in d_all.items())
+        cids_all = [cid for _, cs, _ in subs for cid in cs]
+        cids_con = [cid for _, _, cs in subs for cid in cs]
+        cls_list.append((level, cls[0], cls[1], cls[2], cls[3], tie, x, cids_all, cids_con, subs))
+    cache = {"classes": cls_list,
+             "level_all": _level_tables(level_all),
+             "level_con": _level_tables(level_con)}
+    _CONST_CACHE[con] = cache
+    return cache
+
+
+class _Reservoir:
+    """加权水库：按各候选的“对数量”为权重随机保留至多 k 个候选，O(匹配数)。
+    k == 1 时每步以 w/n 概率替换（精确均匀单抽）；k > 1 用几何跳步
+    （Algorithm-L 风格）——先填满 k 个，再按指数间隔随机替换。"""
+    __slots__ = ("k", "pool", "n", "n_next")
+
+    def __init__(self, k):
+        self.k = k
+        self.pool = []
+        self.n = 0
+        self.n_next = None
+
+    def feed(self, w, cand):
+        if w <= 0:
+            return
+        self.n += w
+        if self.k == 1:
+            if not self.pool or random.random() * self.n < w:
+                self.pool = [cand]
+            return
+        if len(self.pool) < self.k:
+            self.pool.append(cand)
+            if len(self.pool) == self.k:
+                self.n_next = self.n + 1 + int(random.expovariate(self.k / (self.n + 1)))
+            return
+        if self.n >= self.n_next:
+            self.pool[random.randrange(self.k)] = cand
+            self.n_next = self.n + 1 + int(random.expovariate(self.k / (self.n + 1)))
+
+    def resolve(self):
+        """池里每个候选取一对具体组合号（候选 = (a 侧组合号表, b 侧组合号表)）。"""
+        return [(random.choice(a), random.choice(b)) for a, b in self.pool]
+
+
+def _const_scan_dyn(cache, gi_set, k2_set, mode):
+    """约束下动态侧（温度档 × 张力带）成对筛算 → (命中对数, 示例对列表)。
+    逐类对只算一次 gi / k2（类对级公式，与 _DYN_JOINT_TOTALS 同一套口径），
+    权重 = 类和2 侧约束内组合数 × 类和1 侧组合数；b 侧没有约束内组合的类直接跳过。
+    gi/k2 都不限时直接算总数（= 全组合数 × 约束内组合数）并按对均匀抽样；
+    gi 用叉积 = ra·rb·sin(方向差)（2026-09-18 全量类对 0 差核对），只在过滤时才算。"""
+    classes = cache["classes"]
+    classes_b = [cl for cl in classes if cl[8]]
+    k = 1 if mode == "one" else DYN_SAMPLE_COUNT
+    if gi_set is None and k2_set is None:
+        con_b = [cid for cl in classes_b for cid in cl[8]]
+        if not con_b:
+            return 0, []
+        total_a = sum(len(cl[7]) for cl in classes)
+        samples = [(random.randrange(total_a), random.choice(con_b)) for _ in range(k)]
+        return total_a * len(con_b), samples
+    res = _Reservoir(k)
+    count = 0
+    feed = res.feed
+    ceil, abs_, hypot = math.ceil, abs, math.hypot
+    a_rows = [(cl[1], cl[2], cl[3], cl[4], cl[5], cl[6], len(cl[7]), cl[7])
+              for cl in classes]
+    b_rows = [(cl[1], cl[2], cl[3], cl[4], cl[5], cl[6], len(cl[8]), cl[8])
+              for cl in classes_b]
+    for (pax, pay, ra, ca, ta, xa, na, cids_all_a) in a_rows:
+        for (pbx, pby, rb, cb, tb, xb, nb, cids_con_b) in b_rows:
+            if gi_set is not None:
+                if ta or tb or ca or cb:
+                    gi = 5
+                else:
+                    v = (pax * pby - pay * pbx) / 10.0
+                    kk = ceil(abs_(v) / 2 - 1e-12)
+                    if kk > 5:
+                        kk = 5
+                    gi = 5 + kk if v > 0 else 5 - kk
+                if gi not in gi_set:
+                    continue
+            if k2_set is not None:
+                k2 = ceil(hypot(pbx - pax, pby - pay) / 2 - 1e-12) - 1
+                if k2 < 0:
+                    k2 = 0
+                elif k2 > 9:
+                    k2 = 9
+                if k2 not in k2_set:
+                    continue
+            w = na * nb
+            count += w
+            feed(w, (cids_all_a, cids_con_b))
+    return count, res.resolve()
+
+
+def _const_scan_diff(cache, kt_set, kx_set, mode):
+    """约束下差值侧（温度差档 × 张力差档）成对筛算 → (命中对数, 示例对列表)。
+    kx 只由两个等级决定（逐等级对用真值函数现算）；kt 按 a 侧 vt 逐值开窗，
+    b 侧用排序 vt 的前缀计数查窗内组合号——窗口界线与 _diff_t_band 同口径
+    （档 k ⟺ 差 ∈ (2(k-10)+2e-12, 2(k-10)+2+2e-12]，2026-09-18 全量对拍 0 差）。"""
+    level_all = cache["level_all"]
+    level_con = cache["level_con"]
+    res = _Reservoir(1 if mode == "one" else DYN_SAMPLE_COUNT)
+    count = 0
+    windows = []
+    if kt_set is not None:
+        for kk in kt_set:
+            windows.append((2 * (kk - 10) + 2e-12, 2 * (kk - 10) + 2 + 2e-12))
+    for la, (vts_a, _starts_a, flat_a, d_a) in level_all.items():
+        vxa = static_tension(la)
+        for lb, (vts_b, starts_b, flat_b, _d_b) in level_con.items():
+            if kx_set is not None and _diff_x_band(static_tension(lb) - vxa) not in kx_set:
+                continue
+            if kt_set is None:
+                w = len(flat_a) * len(flat_b)
+                count += w
+                res.feed(w, (flat_a, flat_b))
+                continue
+            for va in vts_a:
+                list_a = d_a[va]
+                na = len(list_a)
+                for lo_v, hi_v in windows:
+                    l = bisect.bisect_right(vts_b, va + lo_v)
+                    r = bisect.bisect_right(vts_b, va + hi_v)
+                    if l >= r:
+                        continue
+                    w = na * (starts_b[r] - starts_b[l])
+                    count += w
+                    res.feed(w, (list_a, flat_b[starts_b[l]:starts_b[r]]))
+    return count, res.resolve()
+
+
+def _const_scan_pair4(cache, gi_set, k2_set, kt_set, kx_set, mode):
+    """约束下四维（动态温度/张力 × 温度差/张力差）成对筛算 → (命中对数, 示例对列表)。
+    类对级先过 kx（等级对）× gi × k2，命中的类对再做 vt 子类细分过 kt。
+    四格都不限时直接算总数并按对均匀抽样；gi 用叉积（与 _const_scan_dyn 同口径）。"""
+    classes = cache["classes"]
+    classes_b = [cl for cl in classes if cl[8]]
+    k = 1 if mode == "one" else DYN_SAMPLE_COUNT
+    if gi_set is None and k2_set is None and kt_set is None and kx_set is None:
+        con_b = [cid for cl in classes_b for cid in cl[8]]
+        if not con_b:
+            return 0, []
+        total_a = sum(len(cl[7]) for cl in classes)
+        samples = [(random.randrange(total_a), random.choice(con_b)) for _ in range(k)]
+        return total_a * len(con_b), samples
+    res = _Reservoir(k)
+    count = 0
+    feed = res.feed
+    ceil, abs_, hypot = math.ceil, abs, math.hypot
+    kx_pass = None
+    if kx_set is not None:
+        vx = {cl[0]: static_tension(cl[0]) for cl in classes}
+        kx_pass = {(la, lb) for la in vx for lb in vx
+                   if _diff_x_band(vx[lb] - vx[la]) in kx_set}
+    a_rows = [(cl[0], cl[1], cl[2], cl[3], cl[4], cl[5], cl[6], len(cl[7]), cl[7], cl[9])
+              for cl in classes]
+    b_rows = [(cl[0], cl[1], cl[2], cl[3], cl[4], cl[5], cl[6], len(cl[8]), cl[8], cl[9])
+              for cl in classes_b]
+    for (la, pax, pay, ra, ca, ta, xa, na, cids_all_a, subs_a) in a_rows:
+        for (lb, pbx, pby, rb, cb, tb, xb, nb, cids_con_b, subs_b) in b_rows:
+            if kx_pass is not None and (la, lb) not in kx_pass:
+                continue
+            if gi_set is not None:
+                if ta or tb or ca or cb:
+                    gi = 5
+                else:
+                    v = (pax * pby - pay * pbx) / 10.0
+                    kk = ceil(abs_(v) / 2 - 1e-12)
+                    if kk > 5:
+                        kk = 5
+                    gi = 5 + kk if v > 0 else 5 - kk
+                if gi not in gi_set:
+                    continue
+            if k2_set is not None:
+                k2 = ceil(hypot(pbx - pax, pby - pay) / 2 - 1e-12) - 1
+                if k2 < 0:
+                    k2 = 0
+                elif k2 > 9:
+                    k2 = 9
+                if k2 not in k2_set:
+                    continue
+            if kt_set is None:
+                w = na * nb
+                count += w
+                feed(w, (cids_all_a, cids_con_b))
+                continue
+            for vt_a, sub_a_all, _sa_con in subs_a:
+                for vt_b, _sb_all, sub_b_con in subs_b:
+                    if not sub_b_con:
+                        continue
+                    if _diff_t_band(vt_b - vt_a) not in kt_set:
+                        continue
+                    w = len(sub_a_all) * len(sub_b_con)
+                    count += w
+                    feed(w, (sub_a_all, sub_b_con))
+    return count, res.resolve()
+
+
+def _search_dynamic_con(grade, mode, con):
+    """动态温度查找 · 带约束：现场成对筛算（计数精确），输出带“和弦2 …”标记。"""
+    count, samples = _const_scan_dyn(_const_cache(con), {_GRADE_INDEX[grade]}, None, mode)
+    tag = _con_tag(con, True)
+    if not count:
+        print(f"  没有这种组合：动态温度“{grade}”{tag}命中 0 对。")
+        return
+    if mode == "all":
+        print(f"  动态温度“{grade}”{tag}：共 {count} 对（约束下现场筛算）")
+        print(f"  随机 {len(samples)} 条示例（每个和弦的第一个音是低音）：")
+    else:
+        print(f"  动态温度“{grade}”{tag}：共 {count} 对（约束下现场筛算），随机抽到——")
+    for cid_a, cid_b in samples:
+        print(f"    {format_dyn_pair(cid_a, cid_b)}")
+
+
+def _search_dynamic_attr_con(gi_set, k2_set, desc, mode, con):
+    """动态属性查对 · 带约束：现场成对筛算（计数精确）。"""
+    count, samples = _const_scan_dyn(_const_cache(con), gi_set, k2_set, mode)
+    if desc:
+        head, tag = f"动态属性“{desc}”", _con_tag(con, True)
+    else:
+        head, tag = f"含音/音数约束“{constraint_desc(con)}”", ""
+    if not count:
+        print(f"  没有这种组合：{head}{tag}命中 0 对。")
+        return
+    if mode == "all":
+        print(f"  {head}{tag}：共 {count} 对（约束下现场筛算）")
+        print(f"  随机 {len(samples)} 条示例（每个和弦的第一个音是低音）：")
+    else:
+        print(f"  {head}{tag}：共 {count} 对（约束下现场筛算），随机抽到——")
+    for cid_a, cid_b in samples:
+        print(f"    {format_dyn_pair(cid_a, cid_b)}")
+
+
+def _search_diff_attr_con(kt_set, kx_set, desc, mode, con):
+    """差值查对 · 带约束：现场成对筛算（计数精确）。"""
+    count, samples = _const_scan_diff(_const_cache(con), kt_set, kx_set, mode)
+    if desc:
+        head, tag = f"差值“{desc}”", _con_tag(con, True)
+    else:
+        head, tag = f"含音/音数约束“{constraint_desc(con)}”", ""
+    if not count:
+        print(f"  没有这种组合：{head}{tag}命中 0 对。")
+        return
+    if mode == "all":
+        print(f"  {head}{tag}：共 {count} 对（约束下现场筛算）")
+        print(f"  随机 {len(samples)} 条示例（每个和弦的第一个音是低音）：")
+    else:
+        print(f"  {head}{tag}：共 {count} 对（约束下现场筛算），随机抽到——")
+    for cid_a, cid_b in samples:
+        print(f"    {format_dyn_pair(cid_a, cid_b)}")
+
+
+def _search_pair4_attr_con(gi_set, k2_set, kt_set, kx_set, desc, mode, con):
+    """合并查对（动态 × 差值）· 带约束：现场成对筛算（计数精确）。"""
+    count, samples = _const_scan_pair4(_const_cache(con), gi_set, k2_set, kt_set, kx_set, mode)
+    if desc:
+        head, tag = f"动态+差值“{desc}”", _con_tag(con, True)
+    else:
+        head, tag = f"含音/音数约束“{constraint_desc(con)}”", ""
+    if not count:
+        print(f"  没有这种组合：{head}{tag}命中 0 对。")
+        return
+    if mode == "all":
+        print(f"  {head}{tag}：共 {count} 对（约束下现场筛算）")
+        print(f"  随机 {len(samples)} 条示例（每个和弦的第一个音是低音）：")
+    else:
+        print(f"  {head}{tag}：共 {count} 对（约束下现场筛算），随机抽到——")
+    for cid_a, cid_b in samples:
+        print(f"    {format_dyn_pair(cid_a, cid_b)}")
+
+
 def _static_rows():
     """全部 2~12 音组合（每音轮流当低音）的静态温度表，查一次后缓存。"""
     global _STATIC_ROWS
@@ -2468,19 +2911,23 @@ def _static_rows():
     return _STATIC_ROWS
 
 
-def search_static(grade, mode):
-    """静态温度查找。mode："one" 随机一个；"all" 全部输出。"""
+def search_static(grade, mode, con=None):
+    """静态温度查找。mode："one" 随机一个；"all" 全部输出。
+    con 非空 = 含音/音数约束（结果和弦自身必须满足）。"""
     rows = [r for r in _static_rows() if temp_grade(r[3]) == grade]
+    if con is not None:
+        rows = [r for r in rows if constraint_matches(r[0], con)]
+    tag = "" if con is None else _con_tag(con, False)
     if not rows:
-        print(f"  静态温度里没有“{grade}”档的和弦。")
+        print(f"  静态温度里没有“{grade}”档{tag}的和弦。")
         return
     if mode == "all":
-        print(f"  静态温度“{grade}”：共 {len(rows)} 个（每行第一个音是低音）")
+        print(f"  静态温度“{grade}”{tag}：共 {len(rows)} 个（每行第一个音是低音）")
         for S, bass, level, value, label in rows:
             print(f"    {chord_label(S, bass)}  {value:+.3f} {grade_display(value, label)}  [{level}]  张力 {static_tension(level):.3f}")
     else:
         S, bass, level, value, label = random.choice(rows)
-        print(f"  静态温度“{grade}”：共 {len(rows)} 个，随机抽到——")
+        print(f"  静态温度“{grade}”{tag}：共 {len(rows)} 个，随机抽到——")
         print(f"    {chord_label(S, bass)}  {value:+.3f} {grade_display(value, label)}  [{level}]  张力 {static_tension(level):.3f}")
 
 
@@ -2542,10 +2989,14 @@ def format_dyn_pair(cid_a, cid_b):
             f"  动态张力 {dynamic_tension(a[3], b[3]):.3f}  温度差 {temp_diff:+.3f}  张力差 {tension_diff:+.3f}")
 
 
-def search_dynamic(grade, mode):
+def search_dynamic(grade, mode, con=None):
     """动态温度查找。mode："one" 随机一个；"all" 总数 + 20 条随机示例。
     总数取自常数表（见上）；示例用拒绝抽样——均匀随机抽一对，档位对上就留，
-    留下的就是该档全部有序对上的均匀随机样本。"""
+    留下的就是该档全部有序对上的均匀随机样本。
+    con 非空 = 含音/音数约束（作用于和弦2），改走现场成对筛算（计数精确）。"""
+    if con is not None:
+        _search_dynamic_con(grade, mode, con)
+        return
     combos = _dyn_data()[0]
     total = _DYN_GRADE_TOTALS.get(grade, 0)
     if not total:
@@ -2570,7 +3021,20 @@ def search_dynamic(grade, mode):
         print(f"    {format_dyn_pair(cid_a, cid_b)}")
 
 
-def query_grade_search(text):
+def _prompt_constraint(con_text=""):
+    """CLI 里问一行含音/音数约束（或直接用已给的文本）→ (con, 可继续?)。"""
+    if not con_text:
+        con_text = input("  输入含音/音数约束（回车跳过，如 含 C E 4音）：").strip()
+    if not con_text:
+        return None, True
+    con, err = parse_constraint_arg(con_text)
+    if err:
+        print(err)
+        return None, False
+    return con, True
+
+
+def query_grade_search(text, con=None):
     grade = resolve_grade(text)
     print(f"\n温度等级查找：{grade}")
     kind = input("  查哪种温度？（1 静态 / 2 动态 / 3 两个都查）：").strip()
@@ -2583,15 +3047,19 @@ def query_grade_search(text):
     else:
         print("  已取消。")
         return
+    if con is None:
+        con, ok = _prompt_constraint()
+        if not ok:
+            return
     mode = input("  随机一个还是全部输出？（1 随机一个 / 2 全部输出）：").strip()
     if mode not in ("1", "2", "随机", "全部"):
         print("  已取消。")
         return
     print("-" * 60)
     if "静态" in kinds:
-        search_static(grade, "one" if mode == "1" else "all")
+        search_static(grade, "one" if mode == "1" else "all", con)
     if "动态" in kinds:
-        search_dynamic(grade, "one" if mode == "1" else "all")
+        search_dynamic(grade, "one" if mode == "1" else "all", con)
 
 
 # ========== 温度/张力查询（和弦 ↔ 属性） ==========
@@ -2761,12 +3229,16 @@ def _dyn_attr_count(gi_set, k2_set):
     return sum(_DYN_JOINT_TOTALS[gi][k2] for gi in gis for k2 in k2s)
 
 
-def search_dynamic_attr(gi_set, k2_set, desc, mode):
+def search_dynamic_attr(gi_set, k2_set, desc, mode, con=None):
     """动态属性查对（属性 → 和弦对）。
     gi_set / k2_set：等级号集合 / 张力带号集合，None = 不限。
     小格子（对数 < 3 万）直接取 _DYN_SMALL_CELL_SAMPLES 预存示例，即时给
     1 或 20 条；其余用拒绝抽样（与温度等级查找同一套上限公式）。
-    mode："one" 随机一个；"all" 共几对 + 20 条随机示例。"""
+    mode："one" 随机一个；"all" 共几对 + 20 条随机示例。
+    con 非空 = 含音/音数约束（作用于和弦2），改走现场成对筛算（计数精确）。"""
+    if con is not None:
+        _search_dynamic_attr_con(gi_set, k2_set, desc, mode, con)
+        return
     combos = _dyn_data()[0]
     count = _dyn_attr_count(gi_set, k2_set)
     if not count:
@@ -2830,11 +3302,15 @@ def _diff_static_values():
     return _DIFF_STATIC
 
 
-def search_diff_attr(kt_set, kx_set, desc, mode):
+def search_diff_attr(kt_set, kx_set, desc, mode, con=None):
     """差值查对（温度差/张力差条件 → 和弦对）。
     kt_set / kx_set：温度差档号 0~19 / 张力差档号 0~9 的集合，None = 不限。
     命中数小于 3 万时走 _DIFF_SMALL_CELL_SAMPLES 预存示例（此时选中的非空格子
-    必是小格、都预存过）；其余用拒绝抽样，逐对只查缓存值。"""
+    必是小格、都预存过）；其余用拒绝抽样，逐对只查缓存值。
+    con 非空 = 含音/音数约束（作用于和弦2），改走现场成对筛算（计数精确）。"""
+    if con is not None:
+        _search_diff_attr_con(kt_set, kx_set, desc, mode, con)
+        return
     combos = _dyn_data()[0]
     count = _diff_attr_count(kt_set, kx_set)
     if not count:
@@ -2905,13 +3381,17 @@ def _pair4_count(gi_set, k2_set, kt_set, kx_set):
                and (kt_set is None or kt in kt_set) and (kx_set is None or kx in kx_set))
 
 
-def search_pair4_attr(gi_set, k2_set, kt_set, kx_set, desc, mode):
+def search_pair4_attr(gi_set, k2_set, kt_set, kx_set, desc, mode, con=None):
     """合并查对（动态温度/张力档 × 温度差/张力差档，四组条件同时生效）。
     gi_set / k2_set：等级号 / 张力带号集合；kt_set / kx_set：温度差 / 张力差档
     号集合；None = 不限（调用方保证至少一侧有限定）。
     命中数 < 300 时走 _PAIR4_SMALL_SAMPLES 预存示例（此时范围内每个非空格都
     预存过，不会缺）；其余用两级拒绝抽样：先按缓存静态值筛静态差（便宜），再算
-    动态温度/张力（贵），逐对只算一次，上界公式与既有查询同一套。"""
+    动态温度/张力（贵），逐对只算一次，上界公式与既有查询同一套。
+    con 非空 = 含音/音数约束（作用于和弦2），改走现场成对筛算（计数精确）。"""
+    if con is not None:
+        _search_pair4_attr_con(gi_set, k2_set, kt_set, kx_set, desc, mode, con)
+        return
     combos = _dyn_data()[0]
     count = _pair4_count(gi_set, k2_set, kt_set, kx_set)
     if not count:
@@ -2957,26 +3437,204 @@ def search_pair4_attr(gi_set, k2_set, kt_set, kx_set, desc, mode):
         print(f"    {format_dyn_pair(cid_a, cid_b)}")
 
 
-def search_static_attr(grade_set, level_set, desc, mode):
+def search_static_attr(grade_set, level_set, desc, mode, con=None):
     """静态属性查和弦（属性 → 和弦）。
-    grade_set：温度档集合；level_set：等级集合；None = 不限。mode 同静态查找。"""
+    grade_set：温度档集合；level_set：等级集合；None = 不限。mode 同静态查找。
+    con 非空 = 含音/音数约束（结果和弦自身必须满足）。"""
     rows = [r for r in _static_rows()
             if (grade_set is None or temp_grade(r[3]) in grade_set)
             and (level_set is None or r[2] in level_set)]
+    if con is not None:
+        rows = [r for r in rows if constraint_matches(r[0], con)]
+    if con is None:
+        head, tag = f"静态属性“{desc}”", ""
+    elif desc:
+        head, tag = f"静态属性“{desc}”", _con_tag(con, False)
+    else:
+        head, tag = f"含音/音数约束“{constraint_desc(con)}”", ""
     if not rows:
-        print(f"  没有符合条件的和弦：静态属性“{desc}”命中 0 个。")
+        print(f"  没有符合条件的和弦：{head}{tag}命中 0 个。")
         return
     if mode == "all":
-        print(f"  静态属性“{desc}”：共 {len(rows)} 个（每行第一个音是低音）")
+        print(f"  {head}{tag}：共 {len(rows)} 个（每行第一个音是低音）")
         for S, bass, level, value, label in rows:
             print(f"    {chord_label(S, bass)}  {value:+.3f} {grade_display(value, label)}  [{level}]  张力 {static_tension(level):.3f}")
     else:
         S, bass, level, value, label = random.choice(rows)
-        print(f"  静态属性“{desc}”：共 {len(rows)} 个，随机抽到——")
+        print(f"  {head}{tag}：共 {len(rows)} 个，随机抽到——")
         print(f"    {chord_label(S, bass)}  {value:+.3f} {grade_display(value, label)}  [{level}]  张力 {static_tension(level):.3f}")
 
 
-def query_attr_menu():
+# ========== 生成下一个和弦（2026-09-18 新增） ==========
+_COMBO_INDEX = None
+
+
+def _combo_id(S, bass):
+    """(音集, 低音) → 动态组合号；不在组合表里（等级映射不出半径）返回 None。"""
+    global _COMBO_INDEX
+    if _COMBO_INDEX is None:
+        _COMBO_INDEX = {}
+        for cid, c in enumerate(_dyn_data()[0]):
+            _COMBO_INDEX[(frozenset(c[0]), c[1])] = cid
+    return _COMBO_INDEX.get((frozenset(S), bass))
+
+
+def format_gen_pair(cid_a, cid_b):
+    """生成结果一行：动态四项（同 format_dyn_pair）+ 和弦2 自身的静态温度/张力。"""
+    b = _dyn_data()[0][cid_b]
+    vt, vx = _diff_static_values()[cid_b]
+    return (format_dyn_pair(cid_a, cid_b)
+            + f"  和弦2静态 {vt:+.3f} {grade_display(vt, get_temperature(b[0], b[2], b[1])[1])}"
+            + f"  和弦2张力 {vx:.3f}")
+
+
+def run_generate(start_text, t_text, x_text, td_text, xd_text, st_text, sx_text, mode, con=None):
+    """生成下一个和弦：起点和弦 × 六行条件（下一个和弦的动态温度档 / 动态张力带 /
+    温度差档 / 张力差档，以及它自身的静态温度档 / 静态张力等级）+ 含音/音数约束
+    （作用于和弦2）。条件与约束至少填一个；逐候选用真函数筛算（24540 个一次扫完）。
+    mode："one" 随机一个；"all" 命中数 + 最多 20 条随机示例。"""
+    start_text = start_text.strip()
+    if not start_text:
+        print("  请先给起点和弦（如 C E G）。")
+        return
+    pitch_classes, names, errors = parse_input(start_text)
+    if errors:
+        print(f"  起点和弦里无法识别的音名：{errors}")
+        return
+    if len(pitch_classes) < 2:
+        print("  起点和弦至少需要两个不同的音。")
+        return
+    bass_pc = NAME_TO_PITCH[names[0]]
+    cid_a = _combo_id(pitch_classes, bass_pc)
+    if cid_a is None:
+        print("  起点和弦的等级映射不出半径，生成不了下一个和弦。")
+        return
+    gi_set = k2_set = kt_set = kx_set = g2_set = lv2_set = None
+    desc_parts = []
+    if t_text:
+        cond = parse_temperature_cond(t_text)
+        if cond is None:
+            print(f"  动态温度条件“{t_text}”无法识别（可用：大暖、7、6-8、-8~-6）。")
+            return
+        names_t, disp = cond
+        desc_parts.append(f"动态温度 {disp}")
+        gi_set = {_GRADE_INDEX[g] for g in names_t}
+    if x_text:
+        cond = parse_dynamic_tension_cond(x_text)
+        if cond is None:
+            print(f"  动态张力条件“{x_text}”无法识别（可用：7.5、6-12，范围 0~20）。")
+            return
+        k2_set, disp = cond
+        desc_parts.append(f"动态张力 {disp}")
+    if td_text:
+        cond = parse_diff_band_cond(td_text, 20)
+        if cond is None:
+            print(f"  温度差条件“{td_text}”无法识别（可输档号 1~20，区间如 3-5）。")
+            return
+        kt_set, disp = cond
+        desc_parts.append(f"温度差 {disp}")
+    if xd_text:
+        cond = parse_diff_band_cond(xd_text, 10)
+        if cond is None:
+            print(f"  张力差条件“{xd_text}”无法识别（可输档号 1~10，区间如 3-5）。")
+            return
+        kx_set, disp = cond
+        desc_parts.append(f"张力差 {disp}")
+    if st_text:
+        cond = parse_temperature_cond(st_text)
+        if cond is None:
+            print(f"  和弦2静态温度条件“{st_text}”无法识别（可用：大暖、7、6-8）。")
+            return
+        g2_set, disp = cond
+        desc_parts.append(f"和弦2静态温度 {disp}")
+    if sx_text:
+        cond = parse_static_tension_cond(sx_text)
+        if cond is None:
+            print(f"  和弦2静态张力条件“{sx_text}”无法识别（可用：5a、7、0.645、4-6）。")
+            return
+        lv2_set, disp = cond
+        desc_parts.append(f"和弦2静态张力 {disp}")
+    # 全覆盖 = 没限定（如温度差输 1-20）
+    if gi_set is not None and len(gi_set) == 11:
+        gi_set = None
+    if k2_set is not None and len(k2_set) == 10:
+        k2_set = None
+    if kt_set is not None and len(kt_set) == 20:
+        kt_set = None
+    if kx_set is not None and len(kx_set) == 10:
+        kx_set = None
+    if not (gi_set or k2_set or kt_set or kx_set or g2_set or lv2_set or con is not None):
+        print("  六行条件和含音/音数约束至少要填一个。")
+        return
+    if con is not None:
+        desc_parts.append(constraint_desc(con))
+    combos = _dyn_data()[0]
+    a = combos[cid_a]
+    stats = _diff_static_values()
+    va_t, va_x = stats[cid_a]
+    matches = []
+    for cid_b, b in enumerate(combos):
+        if con is not None and not constraint_matches(b[0], con):
+            continue
+        if lv2_set is not None and b[2] not in lv2_set:
+            continue
+        vt_b, vx_b = stats[cid_b]
+        if g2_set is not None and temp_grade(vt_b) not in g2_set:
+            continue
+        if kt_set is not None and _diff_t_band(vt_b - va_t) not in kt_set:
+            continue
+        if kx_set is not None and _diff_x_band(vx_b - va_x) not in kx_set:
+            continue
+        if k2_set is not None and _tension_band_index(dynamic_tension(a[3], b[3])) not in k2_set:
+            continue
+        if gi_set is not None:
+            value = dynamic_temperature(a[3], b[3], a[4], b[4], a[6], b[6])[0]
+            if _GRADE_INDEX[temp_grade(value)] not in gi_set:
+                continue
+        matches.append(cid_b)
+    print("-" * 60)
+    print(f"  生成下一个和弦：{chord_label(pitch_classes, bass_pc)} → ?")
+    print(f"  条件：{' × '.join(desc_parts)}")
+    if not matches:
+        print("  没有符合条件的下一个和弦。")
+        return
+    k = 1 if mode == "one" else DYN_SAMPLE_COUNT
+    samples = random.sample(matches, min(k, len(matches)))
+    if mode == "all":
+        print(f"  共 {len(matches)} 个（每个和弦的第一个音是低音；随机 {len(samples)} 条示例）：")
+    else:
+        print(f"  共 {len(matches)} 个，随机抽到——")
+    for cid_b in samples:
+        print(f"    {format_gen_pair(cid_a, cid_b)}")
+
+
+def query_generate(start_text="", con=None):
+    """生成下一个和弦（CLI）：起点和弦 → 六行条件 → 约束 → 随机一个/全部。"""
+    print("\n生成下一个和弦：")
+    if not start_text:
+        start_text = input("  请输入起点和弦（如 C E G）：").strip()
+    if not start_text:
+        print("  已取消。")
+        return
+    t_text = input("  下一个和弦的动态温度条件（回车跳过，如 大暖）：").strip()
+    x_text = input("  下一个和弦的动态张力条件（回车跳过，如 6-12）：").strip()
+    td_text = input("  温度差条件（回车跳过，档号 1~20）：").strip()
+    xd_text = input("  张力差条件（回车跳过，档号 1~10）：").strip()
+    st_text = input("  下一个和弦的静态温度条件（回车跳过，如 大暖）：").strip()
+    sx_text = input("  下一个和弦的静态张力条件（回车跳过，如 5a、4-6）：").strip()
+    if con is None:
+        con, ok = _prompt_constraint()
+        if not ok:
+            return
+    mode = input("  随机一个还是全部输出？（1 随机一个 / 2 全部输出）：").strip()
+    if mode not in ("1", "2", "随机", "全部"):
+        print("  已取消。")
+        return
+    run_generate(start_text, t_text, x_text, td_text, xd_text, st_text, sx_text,
+                 "one" if mode == "1" else "all", con)
+
+
+def query_attr_menu(con=None):
     """“查”入口：先选方向（和弦查属性 / 属性查和弦），再选静态/动态。"""
     print("\n温度/张力查询：")
     print("  1) 和弦查属性：输和弦看它的温度和张力（静态 1 个和弦，动态 2 个）")
@@ -2984,9 +3642,12 @@ def query_attr_menu():
     print("     温度差、张力差四行，可混填、至少一个，同时生效")
     choice = input("  1 还是 2？（回车取消）：").strip()
     if choice == "1":
+        if con is not None:
+            print(f"  含音/音数约束（{constraint_desc(con)}）在这里用不上：")
+            print("  和弦查属性看的是你给的那个和弦；约束只筛“属性查和弦”找出来的和弦。")
         query_chord_attr()
     elif choice == "2":
-        query_attr_search()
+        query_attr_search(con)
     else:
         print("  已取消。")
 
@@ -3007,19 +3668,20 @@ def query_chord_attr():
     query_single(text)
 
 
-_ATTR_MIN_ONE = "  四个条件（温度/张力/温度差/张力差）至少输一个。"
+_ATTR_MIN_ONE = "  四个条件（温度/张力/温度差/张力差）至少输一个，或给一个含音/音数约束。"
 
 
-def run_attr_search_cond(t_text, x_text, td_text, xd_text, mode):
+def run_attr_search_cond(t_text, x_text, td_text, xd_text, mode, con=None):
     """属性查和弦（动态）的共用入口：四行条件文本 → 解析 → 分发 → 打印。
     CLI 与两个界面（Tkinter / Kivy）都走这里，保证提示与结果一字不差。
     t_text / x_text：温度（档）、动态张力（带）条件；td_text / xd_text：温度差、
-    张力差档条件。至少填一个；填错就地打印原因。只有动态侧 → search_dynamic_attr、
-    只有差值侧 → search_diff_attr（这两条老路一字未动），两侧都有 → search_pair4_attr。
+    张力差档条件。至少填一个（或给 con 约束）；填错就地打印原因。只有动态侧 →
+    search_dynamic_attr、只有差值侧 → search_diff_attr（这两条老路一字未动），
+    两侧都有 → search_pair4_attr；con 非空 = 结果里的和弦2 必须满足的含音/音数约束。
     mode："one" / "all"，同各既有查找。"""
     t_text, x_text = t_text.strip(), x_text.strip()
     td_text, xd_text = td_text.strip(), xd_text.strip()
-    if not (t_text or x_text or td_text or xd_text):
+    if not (t_text or x_text or td_text or xd_text) and con is None:
         print(_ATTR_MIN_ONE)
         return
     gi_set = k2_set = kt_set = kx_set = None
@@ -3065,42 +3727,21 @@ def run_attr_search_cond(t_text, x_text, td_text, xd_text, mode):
     desc = " × ".join(desc_parts)
     print("-" * 60)
     if kt_set is None and kx_set is None:
-        search_dynamic_attr(gi_set, k2_set, desc, mode)
+        search_dynamic_attr(gi_set, k2_set, desc, mode, con)
     elif gi_set is None and k2_set is None:
-        search_diff_attr(kt_set, kx_set, desc, mode)
+        search_diff_attr(kt_set, kx_set, desc, mode, con)
     else:
-        search_pair4_attr(gi_set, k2_set, kt_set, kx_set, desc, mode)
+        search_pair4_attr(gi_set, k2_set, kt_set, kx_set, desc, mode, con)
 
 
-def query_attr_search():
-    """属性查和弦：先选静态/动态；动态给四个条件行（温度、张力、温度差、张力差），
-    可随意混填、至少一个，同时生效；静态仍是温度/张力两行。"""
-    kind = input("  查静态还是动态？（1 静态 / 2 动态）：").strip()
-    if kind in ("1", "静态", "静"):
-        dynamic = False
-    elif kind in ("2", "动态", "动"):
-        dynamic = True
-    else:
-        print("  已取消。")
-        return
-    if dynamic:
-        t_text = input("  输入温度条件（回车跳过）：").strip()
-        x_text = input("  输入张力条件（回车跳过）：").strip()
-        td_text = input("  输入温度差条件（回车跳过，档号 1~20）：").strip()
-        xd_text = input("  输入张力差条件（回车跳过，档号 1~10）：").strip()
-        if not (t_text or x_text or td_text or xd_text):
-            print(_ATTR_MIN_ONE)
-            return
-        mode = input("  随机一个还是全部输出？（1 随机一个 / 2 全部输出）：").strip()
-        if mode not in ("1", "2", "随机", "全部"):
-            print("  已取消。")
-            return
-        run_attr_search_cond(t_text, x_text, td_text, xd_text, "one" if mode == "1" else "all")
-        return
-    t_text = input("  输入温度条件（回车跳过）：").strip()
-    x_text = input("  输入张力条件（回车跳过）：").strip()
-    if not t_text and not x_text:
-        print("  温度和张力至少输一个。")
+def run_attr_search_static(t_text, x_text, mode, con=None):
+    """属性查和弦（静态）的共用入口：温度/张力两行文本 → 解析 → 打印。
+    CLI 与两个界面（Tkinter / Kivy）都走这里，保证提示与结果一字不差。
+    至少填一个（或给 con 约束）；con 非空 = 结果和弦自身必须满足的约束。
+    mode："one" / "all"，同各既有查找。"""
+    t_text, x_text = t_text.strip(), x_text.strip()
+    if not t_text and not x_text and con is None:
+        print("  温度和张力至少输一个，或给一个含音/音数约束。")
         return
     grade_set = level_set = None
     desc_parts = []
@@ -3119,12 +3760,51 @@ def query_attr_search():
         level_set, disp = cond
         desc_parts.append(f"张力 {disp}")
     desc = " × ".join(desc_parts)
+    print("-" * 60)
+    search_static_attr(grade_set, level_set, desc, mode, con)
+
+
+def query_attr_search(con=None):
+    """属性查和弦：先选静态/动态；动态给四个条件行（温度、张力、温度差、张力差），
+    可随意混填、至少一个，同时生效；静态仍是温度/张力两行。
+    约束没给（con = None）时在这里问一行，可跳过。"""
+    kind = input("  查静态还是动态？（1 静态 / 2 动态）：").strip()
+    if kind in ("1", "静态", "静"):
+        dynamic = False
+    elif kind in ("2", "动态", "动"):
+        dynamic = True
+    else:
+        print("  已取消。")
+        return
+    if dynamic:
+        t_text = input("  输入温度条件（回车跳过）：").strip()
+        x_text = input("  输入张力条件（回车跳过）：").strip()
+        td_text = input("  输入温度差条件（回车跳过，档号 1~20）：").strip()
+        xd_text = input("  输入张力差条件（回车跳过，档号 1~10）：").strip()
+        if con is None:
+            con, ok = _prompt_constraint()
+            if not ok:
+                return
+        if not (t_text or x_text or td_text or xd_text) and con is None:
+            print(_ATTR_MIN_ONE)
+            return
+        mode = input("  随机一个还是全部输出？（1 随机一个 / 2 全部输出）：").strip()
+        if mode not in ("1", "2", "随机", "全部"):
+            print("  已取消。")
+            return
+        run_attr_search_cond(t_text, x_text, td_text, xd_text, "one" if mode == "1" else "all", con)
+        return
+    t_text = input("  输入温度条件（回车跳过）：").strip()
+    x_text = input("  输入张力条件（回车跳过）：").strip()
+    if con is None:
+        con, ok = _prompt_constraint()
+        if not ok:
+            return
     mode = input("  随机一个还是全部输出？（1 随机一个 / 2 全部输出）：").strip()
     if mode not in ("1", "2", "随机", "全部"):
         print("  已取消。")
         return
-    print("-" * 60)
-    search_static_attr(grade_set, level_set, desc, "one" if mode == "1" else "all")
+    run_attr_search_static(t_text, x_text, "one" if mode == "1" else "all", con)
 
 
 # ========== 主程序 ==========
@@ -3153,9 +3833,19 @@ def main():
     print("      温度差 20 档：档1 = -20~-18 … 档10 = -2~0、档11 = 0~2 … 档20 = 18~20")
     print("      张力差 10 档：档1 = -10~-8 … 档5 = -2~0、档6 = 0~2 … 档10 = 8~10")
     print()
+    print("  含音/音数约束（跟在 等级名 / 查 / 生成 后面一起输入，界面里填在约束框）：")
+    print("    含 C E（必须包含这些音）、4音、3-4音（音数 2~12）")
+    print("    例：大暖 含 C 、查 含 C E 4音 、生成 C E G 含 C 6音")
+    print("    成对结果（和弦1 → 和弦2）里的约束一律作用在“和弦2”（被找的下一个和弦）")
+    print()
+    print("  生成下一个和弦：输入 生成 起点和弦（如 生成 C E G），再逐行给六个条件：")
+    print("    下一个和弦的动态温度 / 动态张力、温度差 / 张力差，以及它自身的静态")
+    print("    温度 / 静态张力；可混填、至少一个，配含音/音数约束也行。")
+    print()
     print("命令：")
     print("  batch   批量查询（每行一个和弦）")
     print("  查      温度/张力查询（和弦 ↔ 属性）")
+    print("  生成    生成下一个和弦（起点和弦 + 条件 / 约束）")
     print("  q       退出")
     print("=" * 60)
 
@@ -3169,16 +3859,35 @@ def main():
         # 过滤 VS Code 运行命令回显
         if is_likely_command_line(text):
             continue
-        if text.lower() == "batch":
+        # 含音 / 音数约束：先把约束语句剥出来，剩下的照旧走各入口
+        rest, con, cdesc, cerr = parse_constraints(text)
+        if cerr:
+            print(f"  {cerr}")
+            continue
+        if rest.lower() == "batch":
+            if con is not None:
+                print("  批量查询不支持含音/音数约束（每行都是给定的和弦）。")
+                continue
             query_batch()
             continue
-        if text in ("查", "查询"):
-            query_attr_menu()
+        if rest.startswith("生成"):
+            query_generate(rest[2:].strip(), con)
             continue
-        if resolve_grade(text):
-            query_grade_search(text)
+        if rest in ("查", "查询"):
+            query_attr_menu(con)
             continue
-        query_single(text)
+        if not rest:
+            print(f"  只写了约束（{cdesc}）：前面再加上 等级名 / 查 / 生成，")
+            print("  例如：大暖 含 C 、查 4音 、生成 C E G 含 C E。")
+            continue
+        if resolve_grade(rest):
+            query_grade_search(rest, con)
+            continue
+        if con is not None:
+            print(f"  含音/音数约束（{cdesc}）是“找和弦”用的，跟在 等级名 / 查 / 生成 后面：")
+            print("  例如：大暖 含 C 、查 含 C E 、生成 C E G 含 C 。单个和弦查属性不用约束。")
+            continue
+        query_single(rest)
 
 
 if __name__ == "__main__":

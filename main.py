@@ -6,15 +6,20 @@
 
 本文件不改动命令行程序 src/chord_calculate.py：只 import 它、复用其中全部
 计算与查询函数（query_single / search_static / search_dynamic /
-search_static_attr / search_dynamic_attr / search_diff_attr 等），
+run_attr_search_cond / run_attr_search_static / run_generate 等），
 输出用 redirect_stdout 原样接住显示 —— 与桌面版 src/chord_ui.py 同一套做法，
 算法/数据/文案只有一份。
 
-四个页签与桌面版一致：
-  查询 —— 单和弦 / 和声进行
-  等级 —— 温度 11 档查找（静态 / 动态 / 两个都查；随机一个 / 全部输出）
+五个页签与桌面版一致：
+  查询 —— 单和弦 / 和声进行（也可写 含音/音数约束、写 生成/查/batch/等级名 跳页）
+  等级 —— 温度 11 档查找（静态 / 动态 / 两个都查；随机一个 / 全部输出），可加含音/音数约束
   批量 —— 每行一个和弦
-  查   —— 和弦查属性；属性查和弦（静态 / 动态[温度/张力/温度差/张力差 四条件可混填]）
+  查   —— 和弦查属性；属性查和弦（静态 / 动态[温度/张力/温度差/张力差 四条件可混填]），可加含音/音数约束
+  生成 —— 起点和弦 + 条件（动态温度/动态张力/温度差/张力差 + 下一个和弦的静态温度/静态张力）+ 含音/音数约束 → 下一个和弦
+
+含音/音数约束写法：含 C E、4音、3-4音（约束加在“找出来的和弦”上）。
+结果区（DragScrollTextInput）只读、可以用手指直接上下拖动翻看长结果
+（安卓上 readonly 的 TextInput 不可聚焦，Kivy 自带的滑动滚动用不了，见类注释）。
 
 查询在后台线程里跑，结果经 Clock 回主线程显示，界面不会卡死。
 """
@@ -113,14 +118,24 @@ def core_single(text):
     return _capture(cc.query_single, text)
 
 
-def core_grade(name, kinds, mode):
-    """等级查找。kinds 是 ("静态",) / ("动态",) / ("静态", "动态")；mode 是 "one" / "all"。"""
+def _parse_con_text(con_text):
+    """界面约束框文本 → (con, 错误消息)。空 = (None, "")。"""
+    con, err = cc.parse_constraint_arg(con_text or "")
+    return con, (err or "")
+
+
+def core_grade(name, kinds, mode, con_text=""):
+    """等级查找。kinds 是 ("静态",) / ("动态",) / ("静态", "动态")；mode 是 "one" / "all"。
+    con_text 非空 = 含音/音数约束（结果和弦自身必须满足）。"""
     grade = cc.resolve_grade(name)
+    con, cerr = _parse_con_text(con_text)
+    if cerr:
+        return cerr + "\n"
     out = ["", f"温度等级查找：{grade}", "-" * 60]
     if "静态" in kinds:
-        out.append(_capture(cc.search_static, grade, mode).rstrip("\n"))
+        out.append(_capture(cc.search_static, grade, mode, con).rstrip("\n"))
     if "动态" in kinds:
-        out.append(_capture(cc.search_dynamic, grade, mode).rstrip("\n"))
+        out.append(_capture(cc.search_dynamic, grade, mode, con).rstrip("\n"))
     return "\n".join(out) + "\n"
 
 
@@ -150,34 +165,31 @@ def core_batch(text_lines):
     return "\n".join(out) + "\n"
 
 
-def core_attr_static(t_text, x_text, mode):
-    """属性查和弦（静态）：温度条件 × 张力条件，至少输一个。"""
-    t_text, x_text = t_text.strip(), x_text.strip()
-    if not t_text and not x_text:
-        return "  温度和张力至少输一个。\n"
-    grade_set = level_set = None
-    desc_parts = []
-    if t_text:
-        cond = cc.parse_temperature_cond(t_text)
-        if cond is None:
-            return f"  温度条件“{t_text}”无法识别（可用：大暖、7、6-8、-8~-6）。\n"
-        names, disp = cond
-        desc_parts.append(f"温度 {disp}")
-        grade_set = names
-    if x_text:
-        cond = cc.parse_static_tension_cond(x_text)
-        if cond is None:
-            return f"  张力条件“{x_text}”无法识别（可用：5a、7、0.645、4-6）。\n"
-        level_set, disp = cond
-        desc_parts.append(f"张力 {disp}")
-    desc = " × ".join(desc_parts)
-    return "-" * 60 + "\n" + _capture(cc.search_static_attr, grade_set, level_set, desc, mode)
+def core_attr_static(t_text, x_text, mode, con_text=""):
+    """属性查和弦（静态）：温度条件 × 张力条件，至少输一个；可加含音/音数约束。
+    解析、查错、分发与命令行走同一条路（cc.run_attr_search_static），提示一字不差。"""
+    con, cerr = _parse_con_text(con_text)
+    if cerr:
+        return cerr + "\n"
+    return _capture(cc.run_attr_search_static, t_text, x_text, mode, con)
 
 
-def core_attr_dynamic(t_text, x_text, td_text, xd_text, mode):
-    """属性查和弦（动态）：温度/张力/温度差/张力差四条件可混填，至少一个。
+def core_attr_dynamic(t_text, x_text, td_text, xd_text, mode, con_text=""):
+    """属性查和弦（动态）：温度/张力/温度差/张力差四条件可混填，至少一个；可加含音/音数约束。
     解析、查错、分发与命令行走同一条路（cc.run_attr_search_cond），提示一字不差。"""
-    return _capture(cc.run_attr_search_cond, t_text, x_text, td_text, xd_text, mode)
+    con, cerr = _parse_con_text(con_text)
+    if cerr:
+        return cerr + "\n"
+    return _capture(cc.run_attr_search_cond, t_text, x_text, td_text, xd_text, mode, con)
+
+
+def core_generate(start_text, t_text, x_text, td_text, xd_text, st_text, sx_text, mode, con_text=""):
+    """生成下一个和弦：起点和弦 + 六行条件/约束，至少填一个。
+    解析、查错、分发与命令行走同一条路（cc.run_generate），提示一字不差。"""
+    con, cerr = _parse_con_text(con_text)
+    if cerr:
+        return cerr + "\n"
+    return _capture(cc.run_generate, start_text, t_text, x_text, td_text, xd_text, st_text, sx_text, mode, con)
 
 
 def _prewarm_caches():
@@ -213,10 +225,50 @@ def title_label(text, app):
     return lbl
 
 
+class DragScrollTextInput(TextInput):
+    """结果区：只读 + 手指按住直接上下拖动翻看。
+
+    安卓上 readonly 的 TextInput 不可聚焦（Kivy 处理 readonly 时把 is_focusable 关了），
+    而 Kivy 自带的滑动滚动（scroll_from_swipe）要求先有焦点；更糟的是
+    TextInput.on_touch_move 一看没焦点就 ungrab —— 拖一下就断。两条叠起来，
+    手机上结果区就拖不动（2026-09-18 手机实感 + 模拟触摸定位）。
+    这里自己跟手：按下记位置，拖动时按位移改 scroll_y（与 Kivy 自带手势同向、
+    同样夹在 0 ~ 可滚范围），拖动期间不再把事件递给 TextInput 的原逻辑，
+    免得它把 grab 丢掉；滚轮、双击、长按等还是 Kivy 的原样。
+    """
+
+    _drag_last_y = None
+
+    def on_touch_down(self, touch):
+        handled = super().on_touch_down(touch)
+        if handled and self.multiline and self.minimum_height > self.height:
+            self._drag_last_y = touch.y
+        else:
+            self._drag_last_y = None
+        return handled
+
+    def on_touch_move(self, touch):
+        if self._drag_last_y is not None and touch.grab_current is self:
+            dy = touch.y - self._drag_last_y
+            self._drag_last_y = touch.y
+            if dy:
+                max_scroll_y = max(0, self.minimum_height - self.height)
+                self.scroll_y = min(max(0, self.scroll_y + dy), max_scroll_y)
+                self._trigger_update_graphics()
+                self._have_scrolled = True
+                self.cancel_long_touch_event()
+            return True
+        return super().on_touch_move(touch)
+
+    def on_touch_up(self, touch):
+        self._drag_last_y = None
+        return super().on_touch_up(touch)
+
+
 def result_box():
-    """只读结果区：可滚动、可选中复制，但改不了。"""
-    ti = TextInput(text="", readonly=True, multiline=True, font_name=FONT, font_size=sp(13),
-                   size_hint_y=1)
+    """只读结果区：可拖动滚动、可选中复制，但改不了。"""
+    ti = DragScrollTextInput(text="", readonly=True, multiline=True, font_name=FONT, font_size=sp(13),
+                             size_hint_y=1)
     return ti
 
 
@@ -265,6 +317,17 @@ def set_visible(widget, flag, height=None):
         widget.height = 0
 
 
+class ChordTabbedPanel(TabbedPanel):
+    """开屏那一枪不能留：do_default_tab=False 时 Kivy 在 __init__ 里排了个
+    Clock.schedule_once(_switch_to_first_tab)，实测它要到开屏后 1.1 秒左右才响
+    （首帧就要 0.97 秒，头几帧都在载字体和纹理）。这一枪会把这段时间里已经切走的
+    页签弹回「查询」——手快点页签的、或「查询」页输「生成 …」跳页的，都会被弹回。
+    这里直接把它掐掉，首个页签由 build() 自己 switch_to，时序完全确定。"""
+
+    def _switch_to_first_tab(self, *l):
+        pass
+
+
 # ========== 主界面 ==========
 class ChordApp(App):
     title = "和弦张力等级查询工具"
@@ -285,19 +348,25 @@ class ChordApp(App):
         self.status.bind(size=lambda w, v: setattr(w, "text_size", (v[0] - dp(12), v[1])))
         self.status.padding = [dp(6), 0, dp(6), 0]
 
-        self.tp = TabbedPanel(do_default_tab=False, tab_pos="top_mid", tab_height=dp(36))
+        self.tp = ChordTabbedPanel(do_default_tab=False, tab_pos="top_mid", tab_height=dp(36))
+        # 五个页签平分一屏宽：TabbedPanel 默认每签 100dp，5×100 会把「生成」挤出屏幕
+        self.tp.tab_width = Window.width / 5
+        Window.bind(width=lambda _w, v: setattr(self.tp, "tab_width", v / 5))
         self.tab_query_item = TabbedPanelItem(text=" 查询 ", font_name=FONT)
         self.tab_grade_item = TabbedPanelItem(text=" 等级 ", font_name=FONT)
         self.tab_batch_item = TabbedPanelItem(text=" 批量 ", font_name=FONT)
         self.tab_attr_item = TabbedPanelItem(text=" 查 ", font_name=FONT)
+        self.tab_gen_item = TabbedPanelItem(text=" 生成 ", font_name=FONT)
         for item in (self.tab_query_item, self.tab_grade_item,
-                     self.tab_batch_item, self.tab_attr_item):
+                     self.tab_batch_item, self.tab_attr_item, self.tab_gen_item):
             self.tp.add_widget(item)
 
         self._build_tab_query()
         self._build_tab_grade()
         self._build_tab_batch()
         self._build_tab_attr()
+        self._build_tab_gen()
+        self.tp.switch_to(self.tab_query_item)   # 默认停在「查询」页（取代 Kivy 那枪迟到的首签切换）
 
         root.add_widget(self.tp)
         root.add_widget(self.status)
@@ -361,7 +430,8 @@ class ChordApp(App):
         box.add_widget(row)
         box.add_widget(hint_label(
             "降号用 jD 或 bD（Db、Eb、Ab、Bb）；升号用 #F；带八度也可以（八度会被忽略）。"
-            "输 等级名（如 巨暖）会跳到「等级」页；输 查 / batch 会跳到对应页。", self))
+            "输 等级名（如 巨暖）会跳到「等级」页；输 查 / batch / 生成 会跳到对应页；"
+            "还可加含音/音数约束（如 大暖 含 C、生成 C E G 3-4音）。", self))
         self.box_query = result_box()
         box.add_widget(self.box_query)
         self.tab_query_item.add_widget(box)
@@ -371,21 +441,48 @@ class ChordApp(App):
         if not text:
             self.status.text = "请先输入和弦"
             return
-        if text in ("查", "查询"):
-            self.tp.switch_to(self.tab_attr_item)
-            self.status.text = "已跳到「查」页"
+        # 与命令行同一套路由：先剥出 含音/音数约束，剩下的照旧
+        rest, con, cdesc, cerr = cc.parse_constraints(text)
+        if cerr:
+            self.status.text = cerr
             return
-        if text.lower() == "batch":
+        con_text = cc.constraint_desc(con) if con is not None else ""
+        if rest.lower() == "batch":
+            if con is not None:
+                self.status.text = "批量查询不支持含音/音数约束（每行都是给定的和弦）"
+                return
             self.tp.switch_to(self.tab_batch_item)
             self.status.text = "已跳到「批量」页"
             return
-        grade = cc.resolve_grade(text)
+        if rest.startswith("生成"):
+            self.tp.switch_to(self.tab_gen_item)
+            self.ent_gen_start.text = rest[2:].strip()
+            self.ent_gen_con.text = con_text
+            self.status.text = "已跳到「生成」页，起点和弦与约束已填好，补条件后点「生成」"
+            return
+        if rest in ("查", "查询"):
+            self.tp.switch_to(self.tab_attr_item)
+            # 程序改 state 不会触发 ToggleButton 的互斥逻辑，另一颗要手动弹起
+            self.attr_dir_btns["属性查和弦"].state = "down"
+            self.attr_dir_btns["和弦查属性"].state = "normal"
+            self._refresh_attr()
+            self.ent_as_con.text = con_text
+            self.status.text = "已跳到「查」页（方向：属性查和弦），约束已填好"
+            return
+        if not rest:
+            self.status.text = f"只写了约束（{cdesc}）：可输 等级名 / 查 / 生成 开头，如 大暖 含 C、生成 C E G 含 C E"
+            return
+        grade = cc.resolve_grade(rest)
         if grade:
             self.tp.switch_to(self.tab_grade_item)
             self.grade_spin.text = grade
-            self.status.text = f"“{text}”是温度等级名，已跳到「等级」页，点「查询」即可"
+            self.ent_grade_con.text = con_text
+            self.status.text = f"“{rest}”是温度等级名，已跳到「等级」页，点「查询」即可"
             return
-        self._start_job(lambda: core_single(text), self.box_query)
+        if con is not None:
+            self.status.text = f"含音/音数约束（{cdesc}）是“找和弦”用的，跟在 等级名 / 查 / 生成 后面；单个和弦查属性不用约束"
+            return
+        self._start_job(lambda: core_single(rest), self.box_query)
 
     # ---------- 页签 2：等级查找 ----------
     def _build_tab_grade(self):
@@ -405,10 +502,19 @@ class ChordApp(App):
         row3, self.grade_mode_btns = toggle_row(["随机一个", "全部输出"], "grade_mode", "随机一个")
         box.add_widget(Label(text="输出：", font_name=FONT, font_size=sp(13), size_hint_y=None, height=dp(20)))
         box.add_widget(row3)
+
+        row4 = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(6))
+        row4.add_widget(Label(text="约束：", font_name=FONT, font_size=sp(13), size_hint_x=None, width=dp(44)))
+        self.ent_grade_con = entry(hint="含 C E、4音、3-4音，可留空")
+        self.ent_grade_con.bind(on_text_validate=lambda *_: self._run_grade())
+        row4.add_widget(self.ent_grade_con)
+        box.add_widget(row4)
+
         box.add_widget(flat_button("查询", lambda *_: self._run_grade()))
         box.add_widget(hint_label(
             "每档 2 度：巨冷 大冷 中冷 小冷 微冷 平衡（中性） 微暖 小暖 中暖 大暖 巨暖；"
-            "零值（平衡/中性 两种标签）合并进中间档。动态“全部输出”＝总数 + 20 条随机示例。", self))
+            "零值（平衡/中性 两种标签）合并进中间档。动态“全部输出”＝总数 + 20 条随机示例。"
+            "约束加在“找出来的和弦”上（结果和弦必须满足）。", self))
         self.box_grade = result_box()
         box.add_widget(self.box_grade)
         self.tab_grade_item.add_widget(box)
@@ -421,7 +527,8 @@ class ChordApp(App):
         kind = picked(self.grade_kind_btns)
         kinds = ("静态", "动态") if kind == "两个都查" else (kind,)
         mode = "all" if picked(self.grade_mode_btns) == "全部输出" else "one"
-        self._start_job(lambda: core_grade(grade, kinds, mode), self.box_grade)
+        con_text = self.ent_grade_con.text
+        self._start_job(lambda: core_grade(grade, kinds, mode, con_text), self.box_grade)
 
     # ---------- 页签 3：批量 ----------
     def _build_tab_batch(self):
@@ -492,6 +599,14 @@ class ChordApp(App):
         self.as_box.add_widget(self.row_c4)
         self.lbl_as_hint = hint_label("", self)
         self.as_box.add_widget(self.lbl_as_hint)
+
+        row_as_con = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(6))
+        row_as_con.add_widget(Label(text="约束：", font_name=FONT, font_size=sp(13), size_hint_x=None, width=dp(44)))
+        self.ent_as_con = entry(hint="含 C E、4音、3-4音，可留空")
+        self.ent_as_con.bind(on_text_validate=lambda *_: self._run_attr())
+        row_as_con.add_widget(self.ent_as_con)
+        self.as_box.add_widget(row_as_con)
+
         row_mode = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(4))
         row_mode.add_widget(Label(text="输出：", font_name=FONT, font_size=sp(13), size_hint_x=None, width=dp(44)))
         mode_box, self.as_mode_btns = toggle_row(["随机一个", "全部输出"], "as_mode", "随机一个")
@@ -499,7 +614,7 @@ class ChordApp(App):
         row_mode.add_widget(mode_box)
         row_mode.add_widget(flat_button("查询", lambda *_: self._run_attr()))
         self.as_box.add_widget(row_mode)
-        self.as_box.height = dp(368)
+        self.as_box.height = dp(410)
         box.add_widget(self.as_box)
 
         self.box_attr = result_box()
@@ -521,7 +636,7 @@ class ChordApp(App):
 
         set_visible(self.ca_box, chord_dir, dp(38 + 40 + 6 + 22) if chord_dir else 0)
         set_visible(self.as_box, not chord_dir,
-                    dp(38 + (80 if static else 160) + (66 if static else 110) + 40 + 20) if not chord_dir else 0)
+                    dp(38 + (80 if static else 160) + (66 if static else 110) + 80 + 22) if not chord_dir else 0)
 
         self.lbl_ca_hint.text = ("请输入一个和弦，如 C E G" if picked(self.ca_kind_btns) == "静态（1 个和弦）"
                                  else "请输入两个和弦，用 / 隔开，如 C E G / D F A")
@@ -557,11 +672,84 @@ class ChordApp(App):
         td_text = self.ent_c3.text
         xd_text = self.ent_c4.text
         mode = "all" if picked(self.as_mode_btns) == "全部输出" else "one"
+        con_text = self.ent_as_con.text
         if picked(self.as_kind_btns) == "静态":
-            work = lambda: core_attr_static(t_text, x_text, mode)
+            work = lambda: core_attr_static(t_text, x_text, mode, con_text)
         else:
-            work = lambda: core_attr_dynamic(t_text, x_text, td_text, xd_text, mode)
+            work = lambda: core_attr_dynamic(t_text, x_text, td_text, xd_text, mode, con_text)
         self._start_job(work, self.box_attr)
+
+    # ---------- 页签 5：生成 ----------
+    def _build_tab_gen(self):
+        box = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(4))
+        row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(6))
+        row.add_widget(Label(text="起点和弦：", font_name=FONT, font_size=sp(13), size_hint_x=None, width=dp(76)))
+        self.ent_gen_start = entry(hint="如 C E G")
+        self.ent_gen_start.bind(on_text_validate=lambda *_: self._run_gen())
+        row.add_widget(self.ent_gen_start)
+        box.add_widget(row)
+
+        box.add_widget(hint_label("下一个和弦的条件（六行可混填、至少一行；也可只填约束）：", self))
+
+        def cond_row(label_text, hint):
+            r = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(6))
+            r.add_widget(Label(text=label_text, font_name=FONT, font_size=sp(12), size_hint_x=None, width=dp(126)))
+            ent = entry(hint=hint)
+            ent.bind(on_text_validate=lambda *_: self._run_gen())
+            r.add_widget(ent)
+            return r, ent
+
+        self.row_g1, self.ent_gen_c1 = cond_row("动态温度：", "大暖、7、6-8、-8~-6")
+        box.add_widget(self.row_g1)
+        self.row_g2, self.ent_gen_c2 = cond_row("动态张力：", "7.5、6-12，范围 0~20")
+        box.add_widget(self.row_g2)
+        self.row_g3, self.ent_gen_c3 = cond_row("温度差(1~20)：", "档号或闭区间，和弦2 减和弦1")
+        box.add_widget(self.row_g3)
+        self.row_g4, self.ent_gen_c4 = cond_row("张力差(1~10)：", "档号或闭区间，和弦2 减和弦1")
+        box.add_widget(self.row_g4)
+        self.row_g5, self.ent_gen_c5 = cond_row("和弦2 静态温度：", "大暖、7、6-8、-8~-6")
+        box.add_widget(self.row_g5)
+        self.row_g6, self.ent_gen_c6 = cond_row("和弦2 静态张力：", "5a、7、0.645、4-6")
+        box.add_widget(self.row_g6)
+
+        row_con = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(6))
+        row_con.add_widget(Label(text="约束：", font_name=FONT, font_size=sp(13), size_hint_x=None, width=dp(44)))
+        self.ent_gen_con = entry(hint="含 C E、4音、3-4音，可留空")
+        self.ent_gen_con.bind(on_text_validate=lambda *_: self._run_gen())
+        row_con.add_widget(self.ent_gen_con)
+        box.add_widget(row_con)
+
+        row_mode = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(4))
+        row_mode.add_widget(Label(text="输出：", font_name=FONT, font_size=sp(13), size_hint_x=None, width=dp(44)))
+        mode_box, self.gen_mode_btns = toggle_row(["随机一个", "全部输出"], "gen_mode", "随机一个")
+        mode_box.size_hint_x = 1
+        row_mode.add_widget(mode_box)
+        row_mode.add_widget(flat_button("生成", lambda *_: self._run_gen()))
+        box.add_widget(row_mode)
+
+        box.add_widget(hint_label(
+            "给一个起点和弦（如 C E G），按条件生成符合的下一个和弦；条件作用于“下一个和弦”，"
+            "差值 = 下一个和弦 减 起点和弦。全部输出＝命中数 + 最多 20 条随机示例。", self))
+        self.box_gen = result_box()
+        box.add_widget(self.box_gen)
+        self.tab_gen_item.add_widget(box)
+
+    def _run_gen(self):
+        start = self.ent_gen_start.text.strip()
+        if not start:
+            self.status.text = "请先输入起点和弦（如 C E G）"
+            return
+        t_text = self.ent_gen_c1.text
+        x_text = self.ent_gen_c2.text
+        td_text = self.ent_gen_c3.text
+        xd_text = self.ent_gen_c4.text
+        st_text = self.ent_gen_c5.text
+        sx_text = self.ent_gen_c6.text
+        mode = "all" if picked(self.gen_mode_btns) == "全部输出" else "one"
+        con_text = self.ent_gen_con.text
+        self._start_job(
+            lambda: core_generate(start, t_text, x_text, td_text, xd_text, st_text, sx_text, mode, con_text),
+            self.box_gen)
 
     # ---------- 通用 ----------
     def _clear(self, widget, box):
